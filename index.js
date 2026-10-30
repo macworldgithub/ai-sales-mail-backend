@@ -15,6 +15,14 @@ app.use(cors({ origin(origin, callback) {
 app.use(express.json({ limit: '2mb' }));
 app.get('/', (_req, res) => res.json({ message: 'AI SalesMail API is running' }));
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+app.get('/api/cron/status', async (req, res, next) => {
+  if (!process.env.CRON_SECRET || req.get('Authorization') !== `Bearer ${process.env.CRON_SECRET}`) return res.status(401).json({ message: 'Unauthorized' });
+  try {
+    await connectDB();
+    const lock = await require('./models/JobLock').findById('mail-jobs');
+    res.json({ status: 'ok', lastRunAt: lock?.lastRunAt || null, running: !!lock && lock.expiresAt > new Date() });
+  } catch (error) { next(error); }
+});
 app.get('/api/cron/process', async (req, res, next) => {
   if (!process.env.CRON_SECRET || req.get('Authorization') !== `Bearer ${process.env.CRON_SECRET}`) return res.status(401).json({ message: 'Unauthorized' });
   try { await connectDB(); res.json(await require('./services/jobs').runJobs()); } catch (error) { next(error); }

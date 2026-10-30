@@ -7,6 +7,7 @@ const Reply = require('../models/automatedReplyEmail');
 const FollowUp = require('../models/FollowUpEmail');
 const JobLock = require('../models/JobLock');
 const { mailContent } = require('../utils/email');
+const { dueSchedule } = require('../utils/schedule');
 function transport() {
   if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS || !process.env.TRACKING_SECRET || !process.env.SERVER_URL) throw new Error('Email delivery is not configured');
   return nodemailer.createTransport({
@@ -51,6 +52,7 @@ async function checkReplies(deadline) {
 async function deliver(transporter, campaign, recipient, template, kind) {
   const state = kind === 'initial' ? 'deliveryStatus' : kind === 'reply' ? 'replyStatus' : 'followUpStatus';
   const query = { _id: campaign._id, recipients: { $elemMatch: { email: recipient.email, [state]: { $nin: ['sending', 'sent'] } } } };
+  if (kind === 'initial') Object.assign(query, dueSchedule());
   const claimed = await Campaign.updateOne(query, { $set: { [`recipients.$.${state}`]: 'sending' } });
   if (!claimed.modifiedCount) return;
   const messageId = `<${campaign._id}.${crypto.randomUUID()}@${new URL(process.env.SERVER_URL).hostname}>`;
@@ -67,8 +69,11 @@ async function deliver(transporter, campaign, recipient, template, kind) {
     if (info.rejected?.length) { const error = new Error('Recipient rejected by mail server'); error.responseCode = 550; throw error; }
   } catch (error) {
     const safeToRetry = error.responseCode >= 400 || ['EDNS', 'ECONNECTION', 'EAUTH'].includes(error.code);
+    const reason = error.code === 'EAUTH' ? 'Mailbox authentication failed. Check EMAIL_USER and EMAIL_PASS.'
+      : ['EDNS', 'ECONNECTION'].includes(error.code) ? 'Cannot connect to the SMTP server. Check the mail server settings.'
+      : 'The SMTP server rejected the message.';
     await Campaign.updateOne({ _id: campaign._id, 'recipients.email': recipient.email }, {
-      $set: { [`recipients.$.${state}`]: safeToRetry ? 'failed' : 'sending', 'recipients.$.lastError': safeToRetry ? 'Mail delivery failed' : 'Delivery outcome is uncertain. Review the sender mailbox before retrying.' },
+      $set: { [`recipients.$.${state}`]: safeToRetry ? 'failed' : 'sending', 'recipients.$.lastError': safeToRetry ? reason : 'Delivery outcome is uncertain. Review the sender mailbox before retrying.' },
       $inc: { [`recipients.$.${kind}Attempts`]: 1 },
     });
     return;
@@ -81,24 +86,32 @@ async function deliver(transporter, campaign, recipient, template, kind) {
   // A database failure after SMTP must leave "sending" for manual review, never automatic resend.
   await Campaign.updateOne({ _id: campaign._id, 'recipients.email': recipient.email }, update);
 }
-async function runJobs({ transporter: providedTransport, checkInbox = checkReplies } = {}) {
+async function runJobs({ transporter: providedTransport, checkInbox = checkReplies, campaignId, userId, includeAutomation = true, timeBudgetMs = 180000 } = {}) {
   const owner = crypto.randomUUID();
   const now = new Date();
   try {
     const lock = await JobLock.findOneAndUpdate({ _id: 'mail-jobs', expiresAt: { $lt: now } }, { $set: { owner, expiresAt: new Date(Date.now() + 330000) } }, { upsert: true, new: true });
     if (lock.owner !== owner) return { skipped: true };
   } catch (error) { if (error.code === 11000) return { skipped: true }; throw error; }
-  const deadline = Date.now() + 180000;
+  const deadline = Date.now() + timeBudgetMs;
   let processed = 0;
   const errors = [];
   try {
     const transporter = providedTransport || transport();
-    try { await checkInbox(Math.min(deadline, Date.now() + 45000)); } catch { errors.push('Inbox checking failed. Check IMAP credentials and access.'); }
-    const campaigns = await Campaign.find({ userId: { $exists: true }, $or: [{ status: { $in: ['queued', 'sending'] } }, { hasFollowUp: true }, { isAutomatedReply: true }] }).sort({ updatedAt: 1 }).limit(25);
+    if (includeAutomation) {
+      try { await checkInbox(Math.min(deadline, Date.now() + 45000)); } catch { errors.push('Inbox checking failed. Check IMAP credentials and access.'); }
+    }
+    const eligible = [{ status: { $in: ['scheduled', 'queued', 'sending'] } }];
+    if (includeAutomation) eligible.push({ hasFollowUp: true }, { isAutomatedReply: true });
+    const campaigns = await Campaign.find({
+      ...(campaignId ? { _id: campaignId } : {}),
+      userId: userId || { $exists: true },
+      $and: [dueSchedule(), { $or: eligible }],
+    }).sort({ updatedAt: 1 }).limit(25);
     for (const campaign of campaigns) {
       if (Date.now() > deadline || processed >= 25) break;
-      const reply = campaign.isAutomatedReply ? await Reply.findOne({ campaignId: String(campaign._id) }).sort({ updatedAt: -1 }) : null;
-      const followUp = campaign.hasFollowUp ? await FollowUp.findOne({ campaignId: String(campaign._id) }).sort({ updatedAt: -1 }) : null;
+      const reply = includeAutomation && campaign.isAutomatedReply ? await Reply.findOne({ campaignId: String(campaign._id) }).sort({ updatedAt: -1 }) : null;
+      const followUp = includeAutomation && campaign.hasFollowUp ? await FollowUp.findOne({ campaignId: String(campaign._id) }).sort({ updatedAt: -1 }) : null;
       for (const recipient of campaign.recipients) {
         if (Date.now() > deadline || processed >= 25) break;
         let kind, template;
@@ -109,14 +122,17 @@ async function runJobs({ transporter: providedTransport, checkInbox = checkRepli
       }
       const fresh = await Campaign.findById(campaign._id);
       const states = fresh.recipients.map(r => r.deliveryStatus);
-      const status = states.every(s => s === 'sent') ? 'sent'
+      const status = fresh.scheduledAt && fresh.scheduledAt.getTime() > Date.now() && !fresh.totalEmailSent ? 'scheduled'
+        : states.every(s => s === 'sent') ? 'sent'
         : fresh.recipients.some(r => ['pending', 'failed'].includes(r.deliveryStatus) && (r.initialAttempts || 0) < 3) ? 'sending'
         : states.includes('sending') ? 'attention' : 'failed';
-      await Campaign.updateOne({ _id: campaign._id }, { $set: { status } });
+      const lastDeliveryError = [...new Set(fresh.recipients.map(r => r.lastError).filter(Boolean))].join(' ') || null;
+      // Do not overwrite a schedule changed after this batch read the campaign.
+      await Campaign.updateOne({ _id: campaign._id, scheduledAt: fresh.scheduledAt || null }, { $set: { status, lastDeliveryError, lastProcessedAt: new Date() } });
     }
     return { processed, errors };
   } finally {
-    await JobLock.updateOne({ _id: 'mail-jobs', owner }, { $set: { expiresAt: new Date(0) } });
+    await JobLock.updateOne({ _id: 'mail-jobs', owner }, { $set: { expiresAt: new Date(0), lastRunAt: new Date() } });
   }
 }
 module.exports = { runJobs, deliver };

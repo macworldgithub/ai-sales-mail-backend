@@ -10,7 +10,8 @@ process.env.EMAIL_USER = 'sender@example.com';
 process.env.EMAIL_PASS = 'test-only';
 process.env.SERVER_URL = 'https://api.example.com';
 process.env.FRONTEND_URL = 'http://localhost:5173';
-delete process.env.AI_API_KEY;
+// An empty value prevents dotenv from loading a real local provider key.
+process.env.AI_API_KEY = '';
 const Campaign = require('../models/compaign');
 const Template = require('../models/Template');
 const Reply = require('../models/automatedReplyEmail');
@@ -47,6 +48,9 @@ test('health, allowed preflight and disallowed origins', async () => {
   assert.equal(preflight.headers.get('access-control-allow-origin'), 'http://localhost:5173');
   assert.equal((await request('/health', 'GET', undefined, undefined, { Origin: 'https://untrusted.example' })).status, 403);
   assert.equal((await request('/api/cron/process')).status, 401);
+  assert.equal((await request('/api/cron/status')).status, 401);
+  const schedulerStatus = await request('/api/cron/status', 'GET', undefined, process.env.CRON_SECRET);
+  assert.equal(schedulerStatus.status, 200);
 });
 test('validates auth, normalizes email and expires tokens', async () => {
   assert.equal((await request('/api/auth/signup', 'POST', { email: {}, password: 'short' })).status, 400);
@@ -169,6 +173,49 @@ test('scheduled worker sends due follow-ups and acknowledgements only once', asy
   assert.equal(fresh.recipients[0].followUpStatus, 'sent');
   assert.equal(fresh.recipients[1].autoReplySent, true);
   assert.equal(sent.find(mail => mail.to === 'replied@example.com').inReplyTo, '<reply@example.com>');
+});
+test('future schedules use UTC and are not processed early', async () => {
+  const { parseSchedule } = require('../utils/schedule');
+  assert.equal(parseSchedule('2035-01-01T13:00:00+05:00').toISOString(), '2035-01-01T08:00:00.000Z');
+  for (const value of ['invalid', '2000-01-01T00:00:00Z', '2035-01-01T13:00', 123]) assert.throws(() => parseSchedule(value));
+  const created = await request('/campaigns/create', 'POST', { ...campaignData, scheduledAt: new Date(Date.now() + 3600000).toISOString() }, tokenA);
+  assert.equal(created.status, 201); assert.equal(created.data.campaign.status, 'scheduled');
+  const id = created.data.campaign._id;
+  let sends = 0;
+  const transporter = { sendMail: async () => { sends++; return { rejected: [] }; } };
+  const result = await runJobs({ campaignId: id, userId: require('jsonwebtoken').decode(tokenA).id, includeAutomation: false, transporter });
+  assert.equal(result.processed, 0); assert.equal(sends, 0);
+  assert.equal((await request('/campaigns/' + id + '/process', 'POST', {}, tokenA)).status, 409);
+  assert.equal((await request('/campaigns/' + id + '/process', 'POST', {}, tokenB)).status, 404);
+  await Campaign.updateOne({ _id: id }, { $set: { scheduledAt: new Date(Date.now() - 60000) } });
+  await runJobs({ campaignId: id, includeAutomation: false, transporter });
+  assert.equal(sends, 1); assert.equal((await Campaign.findById(id)).status, 'sent');
+});
+test('only the owner can reschedule a campaign before delivery starts', async () => {
+  const created = await request('/campaigns/create', 'POST', campaignData, tokenA);
+  const id = created.data.campaign._id;
+  const scheduledAt = new Date(Date.now() + 7200000).toISOString();
+  assert.equal((await request('/campaigns/' + id + '/schedule', 'PATCH', { scheduledAt }, tokenB)).status, 404);
+  assert.equal((await request('/campaigns/' + id + '/schedule', 'PATCH', { scheduledAt: 'bad' }, tokenA)).status, 400);
+  const scheduled = await request('/campaigns/' + id + '/schedule', 'PATCH', { scheduledAt }, tokenA);
+  assert.equal(scheduled.status, 200); assert.equal(scheduled.data.campaign.scheduledAt, scheduledAt);
+  let sends = 0;
+  const fresh = await Campaign.findById(id);
+  await deliver({ sendMail: async () => { sends++; return { rejected: [] }; } }, fresh, fresh.recipients[0], fresh, 'initial');
+  assert.equal(sends, 0);
+  assert.equal((await request('/campaigns/' + id + '/schedule', 'PATCH', {}, tokenA)).status, 400);
+  const immediate = await request('/campaigns/' + id + '/schedule', 'PATCH', { scheduledAt: null }, tokenA);
+  assert.equal(immediate.status, 200); assert.equal(immediate.data.campaign.status, 'queued');
+  await Campaign.updateOne({ _id: id }, { $set: { 'recipients.0.deliveryStatus': 'sending' } });
+  assert.equal((await request('/campaigns/' + id + '/schedule', 'PATCH', { scheduledAt }, tokenA)).status, 409);
+});
+test('manual processing is scoped to the requested user and campaign', async () => {
+  const a = await request('/campaigns/create', 'POST', campaignData, tokenA);
+  const b = await request('/campaigns/create', 'POST', campaignData, tokenB);
+  let sends = 0;
+  await runJobs({ campaignId: a.data.campaign._id, userId: require('jsonwebtoken').decode(tokenA).id, includeAutomation: false, transporter: { sendMail: async () => { sends++; return { rejected: [] }; } } });
+  assert.equal(sends, 1);
+  assert.equal((await Campaign.findById(b.data.campaign._id)).totalEmailSent, 0);
 });
 test('scheduled worker respects another invocation’s lease', async () => {
   const JobLock = require('../models/JobLock');

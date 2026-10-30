@@ -1,0 +1,40 @@
+name: Process scheduled mail
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      check_only:
+        description: Verify the connection without sending any mail
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: process-scheduled-mail
+  cancel-in-progress: false
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      BACKEND_URL: https://ai-sales-mail-backend-ten.vercel.app
+      CRON_SECRET: ${{ secrets.CRON_SECRET }}
+      CHECK_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.check_only || false }}
+    steps:
+      - name: Check connection or process due mail
+        shell: bash
+        run: |
+          if [ -z "$CRON_SECRET" ]; then
+            echo "::notice::Add the backend CRON_SECRET as a repository Actions secret to enable delivery."
+            exit 0
+          fi
+          endpoint="process"
+          if [ "$CHECK_ONLY" = "true" ]; then endpoint="status"; fi
+          curl --silent --show-error --fail \
+            --connect-timeout 15 --max-time 240 \
+            --header "Authorization: Bearer ${CRON_SECRET}" \
+            "${BACKEND_URL}/api/cron/${endpoint}"
