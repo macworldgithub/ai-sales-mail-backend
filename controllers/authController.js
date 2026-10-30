@@ -1,61 +1,27 @@
-const User = require("../models/User");
-const bcrypt = require("bcryptjs");
-const jwt = require("jsonwebtoken");
-const { validationResult } = require("express-validator");
-
-exports.signup = async (req, res) => {
+const User = require('../models/User');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { validationResult } = require('express-validator');
+const { asyncRoute, fail } = require('../utils/http');
+function validate(req) {
   const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ errors: errors.array() });
-  }
-
-  const { firstname, email, password } = req.body;
-  if (!firstname || !email || !password) {
-    return res
-      .status(400)
-      .json({ message: "Please Provide all Fields, firstname,email,password" });
-  }
-  try {
-    let user = await User.findOne({ email });
-    if (user) {
-      return res.status(400).json({ message: "User already exists" });
-    }
-
-    const hashedPassword = await bcrypt.hash(password, 10);
-    user = new User({ firstname, email, password: hashedPassword });
-    await user.save();
-
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET);
-    res.status(201).json({ message: "User registered successfully", token });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: "Server Error" });
-  }
-};
-
-exports.login = async (req, res) => {
-  const { email, password } = req.body;
-  if (!email) {
-    return res.status(400).json({ message: "Please Provide Email" });
-  }
-  if (!password) {
-    return res.status(400).json({ message: "Please Provide Password" });
-  }
-  try {
-    const user = await User.findOne({ email });
-    if (!user) {
-      return res.status(400).json({ message: "Invalid credentials" });
-    }
-
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) {
-      return res.status(400).json({ message: "Invalid credentials" });
-    }
-
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET);
-    res.json({ message: "Login successful", token });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: "Server Error" });
-  }
-};
+  if (!errors.isEmpty()) fail(400, errors.array()[0].msg);
+  if (!process.env.JWT_SECRET) fail(503, 'Authentication is not configured');
+}
+function session(user) {
+  return { token: jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d', algorithm: 'HS256' }), user: { firstname: user.firstname, email: user.email } };
+}
+exports.signup = asyncRoute(async (req, res) => {
+  validate(req);
+  const email = req.body.email.trim().toLowerCase();
+  if (await User.exists({ email })) fail(409, 'An account with this email already exists');
+  const password = await bcrypt.hash(req.body.password, 12);
+  const user = await User.create({ firstname: req.body.firstname.trim(), email, password });
+  res.status(201).json(session(user));
+});
+exports.login = asyncRoute(async (req, res) => {
+  validate(req);
+  const user = await User.findOne({ email: req.body.email.trim().toLowerCase() });
+  if (!user || !await bcrypt.compare(req.body.password, user.password)) fail(401, 'Invalid email or password');
+  res.json(session(user));
+});

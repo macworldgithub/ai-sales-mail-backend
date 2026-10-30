@@ -9,6 +9,8 @@ const {
 
 const authMiddleware = require("../middlewares/authMiddleware");
 const router = express.Router();
+router.use((req, res, next) => req.method === 'POST' ? authMiddleware(req, res, next) : next());
+router.use((req, res, next) => req.method === 'POST' ? require('../middlewares/rateLimit')('ai', 60, 3600000)(req, res, next) : next());
 
 router.post("/generate", authMiddleware, GenerateEmail);
 router.post("/makeChanges", authMiddleware, MakeChangesToEmail);

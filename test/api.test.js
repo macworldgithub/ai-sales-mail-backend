@@ -1,0 +1,192 @@
+const { test, before, after } = require('node:test');
+const assert = require('node:assert/strict');
+const mongoose = require('mongoose');
+const { MongoMemoryServer } = require('mongodb-memory-server-core');
+let mongo, server, base, tokenA, tokenB, campaignId, templateId;
+process.env.JWT_SECRET = 'isolated-test-jwt-secret';
+process.env.CRON_SECRET = 'isolated-test-cron-secret';
+process.env.TRACKING_SECRET = 'isolated-test-tracking-secret';
+process.env.EMAIL_USER = 'sender@example.com';
+process.env.EMAIL_PASS = 'test-only';
+process.env.SERVER_URL = 'https://api.example.com';
+process.env.FRONTEND_URL = 'http://localhost:5173';
+delete process.env.AI_API_KEY;
+const Campaign = require('../models/compaign');
+const Template = require('../models/Template');
+const Reply = require('../models/automatedReplyEmail');
+const FollowUp = require('../models/FollowUpEmail');
+const { trackingToken, normalizeRecipients, mailContent, personalize } = require('../utils/email');
+const { extractJson } = require('../controllers/emailGeneration');
+const { deliver, runJobs } = require('../services/jobs');
+const fields = { emailTemplateSubject: 'Hello {{First Name}}', emailTemplateBody: 'Meet {{First Name}}', emailTemplateClosing: 'Thank you' };
+const campaignData = { campaignName: 'Launch', description: 'Product announcement', ...fields, recipients: [{ Email: 'CLIENT@example.com', 'First Name': '<Alice>' }] };
+async function request(path, method = 'GET', data, token, headers = {}) {
+  const response = await fetch(base + path, { method, headers: { ...(data ? { 'Content-Type': 'application/json' } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}), ...headers }, ...(data ? { body: JSON.stringify(data) } : {}) });
+  const content = response.headers.get('content-type')?.includes('application/json') ? await response.json() : await response.arrayBuffer();
+  return { status: response.status, data: content, headers: response.headers };
+}
+before(async () => {
+  const path = require('node:path');
+  const fs = require('node:fs');
+  const cache = path.resolve(__dirname, '../.cache');
+  fs.mkdirSync(cache, { recursive: true });
+  const dbPath = fs.mkdtempSync(path.join(cache, 'test-db-'));
+  mongo = await MongoMemoryServer.create({ instance: { dbPath }, binary: { version: '7.0.14', downloadDir: path.join(cache, 'mongodb') } });
+  process.env.MONGO_URI = mongo.getUri('sales-mail-test');
+  await require('../config/db')();
+  await Promise.all([Campaign.init(), Template.init(), Reply.init(), FollowUp.init()]);
+  server = require('../index').listen(0, '127.0.0.1');
+  await new Promise(resolve => server.once('listening', resolve));
+  base = `http://127.0.0.1:${server.address().port}`;
+});
+after(async () => { if (server) await new Promise(resolve => server.close(resolve)); await mongoose.disconnect(); if (mongo) await mongo.stop(); });
+test('health, allowed preflight and disallowed origins', async () => {
+  assert.equal((await request('/health')).status, 200);
+  const preflight = await request('/campaigns/create', 'OPTIONS', undefined, undefined, { Origin: 'http://localhost:5173', 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'authorization,idempotency-key' });
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get('access-control-allow-origin'), 'http://localhost:5173');
+  assert.equal((await request('/health', 'GET', undefined, undefined, { Origin: 'https://untrusted.example' })).status, 403);
+  assert.equal((await request('/api/cron/process')).status, 401);
+});
+test('validates auth, normalizes email and expires tokens', async () => {
+  assert.equal((await request('/api/auth/signup', 'POST', { email: {}, password: 'short' })).status, 400);
+  const a = await request('/api/auth/signup', 'POST', { firstname: 'Alice', email: 'ALICE@example.com', password: 'correct-password' });
+  assert.equal(a.status, 201); tokenA = a.data.token;
+  const payload = require('jsonwebtoken').decode(tokenA);
+  assert.ok(payload.exp > payload.iat);
+  const b = await request('/api/auth/signup', 'POST', { firstname: 'Bob', email: 'bob@example.com', password: 'correct-password' });
+  tokenB = b.data.token;
+  assert.equal((await request('/api/auth/login', 'POST', { email: 'Alice@example.com', password: 'correct-password' })).status, 200);
+  assert.equal((await request('/api/auth/login', 'POST', { email: 'alice@example.com', password: 'wrong-password' })).status, 401);
+  assert.equal((await request('/campaigns/getAll')).status, 401);
+});
+test('validates recipient imports and safe placeholder substitution', () => {
+  assert.throws(() => normalizeRecipients([]), /between 1 and 1000/);
+  assert.throws(() => normalizeRecipients([{ email: 'bad' }]), /Invalid email/);
+  assert.throws(() => normalizeRecipients([{ email: 'a@b.com' }, { Email: 'A@B.com' }]), /Duplicate/);
+  const [recipient] = normalizeRecipients([{ Email: 'A@b.com', 'First Name': '$& <script>', opened: 1, deliveryStatus: 'sent' }]);
+  assert.equal(recipient.opened, 0); assert.equal(recipient.deliveryStatus, 'pending');
+  assert.equal(personalize('Hello {{First Name}}', recipient), 'Hello $& <script>');
+  assert.ok(mailContent(fields, recipient, '123').html.includes('&lt;script&gt;'));
+  assert.equal(personalize('{{missing}}', recipient), '{{missing}}');
+});
+test('campaign creation is idempotent and scoped to its owner', async () => {
+  assert.equal((await request('/campaigns/create', 'POST', { ...campaignData, recipients: [] }, tokenA)).status, 400);
+  const headers = { 'Idempotency-Key': 'test-request-key-123456789' };
+  const first = await request('/campaigns/create', 'POST', campaignData, tokenA, headers);
+  assert.equal(first.status, 201); campaignId = first.data.campaign._id;
+  const retry = await request('/campaigns/create', 'POST', campaignData, tokenA, headers);
+  assert.equal(retry.data.campaign._id, campaignId);
+  assert.equal(await Campaign.countDocuments(), 1);
+  assert.equal((await request('/campaigns/getAll', 'GET', undefined, tokenA)).data.total, 1);
+  assert.equal((await request('/campaigns/getAll', 'GET', undefined, tokenB)).data.total, 0);
+  assert.equal((await request('/campaigns/getById/' + campaignId, 'GET', undefined, tokenB)).status, 404);
+  assert.equal((await request('/campaigns/getById/invalid', 'GET', undefined, tokenA)).status, 400);
+  assert.equal((await request('/campaigns/getAll?search=%5B', 'GET', undefined, tokenA)).status, 200);
+  assert.equal((await request('/campaigns/total', 'GET', undefined, tokenB)).data.totalCampaigns, 0);
+});
+test('template ownership cannot be changed by an update', async () => {
+  const created = await request('/templates/create', 'POST', { templateName: 'Welcome', templatePurpose: 'Welcome people', emailSubject: 'Hi', emailBody: 'Welcome', emailClosing: 'Regards' }, tokenA);
+  assert.equal(created.status, 201); templateId = created.data.template._id;
+  assert.equal((await request('/templates/getById/' + templateId, 'GET', undefined, tokenB)).status, 404);
+  assert.equal((await request('/templates/update/' + templateId, 'PUT', { emailSubject: 'Hacked' }, tokenB)).status, 404);
+  const owner = require('jsonwebtoken').decode(tokenA).id;
+  await request('/templates/update/' + templateId, 'PUT', { emailSubject: 'New', userId: require('jsonwebtoken').decode(tokenB).id }, tokenA);
+  assert.equal(String((await Template.findById(templateId)).userId), owner);
+  assert.equal((await request('/templates/total', 'GET', undefined, tokenB)).data.total, 0);
+});
+test('automation ownership, upsert and follow-up duration', async () => {
+  assert.equal((await request('/automated-reply/enableAutomation', 'POST', { campaignId, ...fields }, tokenB)).status, 404);
+  const enabled = await Promise.all([request('/automated-reply/enableAutomation', 'POST', { campaignId, ...fields }, tokenA), request('/automated-reply/enableAutomation', 'POST', { campaignId, ...fields }, tokenA)]);
+  for (const response of enabled) assert.equal(response.status, 201);
+  assert.equal(await Reply.countDocuments({ campaignId }), 1);
+  assert.equal((await request('/follow-up/enableFollowUp', 'POST', { campaignId, ...fields, followUpDuration: 0 }, tokenA)).status, 400);
+  assert.equal((await request('/follow-up/enableFollowUp', 'POST', { campaignId, ...fields, followUpDuration: 3 }, tokenA)).status, 201);
+  assert.equal((await request('/follow-up/updateFollowUp/' + campaignId, 'PUT', { ...fields, followUpDuration: 7 }, tokenA)).status, 200);
+  assert.equal((await Campaign.findById(campaignId)).followUpDuration, 7);
+  assert.equal((await request('/follow-up/removeFollowUp/' + campaignId, 'DELETE', undefined, tokenB)).status, 404);
+  assert.equal((await request('/follow-up/removeFollowUp/' + campaignId, 'DELETE', undefined, tokenA)).status, 200);
+  assert.equal((await Campaign.findById(campaignId)).hasFollowUp, false);
+});
+test('AI parses plain and fenced JSON and reports unconfigured service', async () => {
+  const expected = { subject: 'Hi', body: 'Body', closing: 'Bye' };
+  assert.deepEqual(extractJson(JSON.stringify(expected)), expected);
+  assert.deepEqual(extractJson('```json\n' + JSON.stringify(expected) + '\n```'), expected);
+  assert.throws(() => extractJson('invalid'), /invalid JSON/);
+  assert.throws(() => extractJson('{"subject":"Only subject"}'), /incomplete/);
+  assert.equal((await request('/email/generate', 'POST', { emailPurpose: 'Welcome', templatePlaceholders: ['email'] }, tokenA)).status, 503);
+  assert.equal((await request('/email/generateAutomatedEmail', 'POST', { campaignId }, tokenB)).status, 404);
+});
+test('delivery records success once and tracking counts first open exactly once', async () => {
+  let calls = 0;
+  let campaign = await Campaign.findById(campaignId);
+  const transporter = { sendMail: async options => { calls++; assert.ok(options.html.includes('&lt;Alice&gt;')); return { accepted: [options.to], rejected: [] }; } };
+  await deliver(transporter, campaign, campaign.recipients[0], campaign, 'initial');
+  campaign = await Campaign.findById(campaignId);
+  await deliver(transporter, campaign, campaign.recipients[0], campaign, 'initial');
+  assert.equal(calls, 1);
+  assert.equal(campaign.totalEmailSent, 1);
+  const email = 'client@example.com';
+  const url = '/email/emailTracker?' + new URLSearchParams({ campaignId, email, token: trackingToken(campaignId, email) });
+  assert.equal((await request(url)).headers.get('content-type'), 'image/gif');
+  assert.equal((await request(url)).status, 200);
+  assert.equal((await Campaign.findById(campaignId)).totalEmailOpened, 1);
+  assert.equal((await request(url.replace(/token=[^&]+/, 'token=bad'))).status, 400);
+});
+test('rejected SMTP delivery does not inflate sent counters', async () => {
+  const owner = require('jsonwebtoken').decode(tokenA).id;
+  const campaign = await Campaign.create({ userId: owner, campaignName: 'Failed send', description: 'Failure', ...fields, recipients: normalizeRecipients([{ email: 'other@example.com' }]) });
+  await deliver({ sendMail: async () => { const error = new Error('SMTP unavailable'); error.code = 'ECONNECTION'; throw error; } }, campaign, campaign.recipients[0], campaign, 'initial');
+  const fresh = await Campaign.findById(campaign._id);
+  assert.equal(fresh.totalEmailSent, 0); assert.equal(fresh.recipients[0].deliveryStatus, 'failed'); assert.equal(fresh.recipients[0].initialAttempts, 1);
+});
+test('ambiguous SMTP outcomes are held for review instead of automatically resent', async () => {
+  const owner = require('jsonwebtoken').decode(tokenA).id;
+  const campaign = await Campaign.create({ userId: owner, campaignName: 'Uncertain send', description: 'Timeout', ...fields, recipients: normalizeRecipients([{ email: 'uncertain@example.com' }]) });
+  let calls = 0;
+  await deliver({ sendMail: async () => { calls++; throw new Error('Connection dropped after DATA'); } }, campaign, campaign.recipients[0], campaign, 'initial');
+  const fresh = await Campaign.findById(campaign._id);
+  await deliver({ sendMail: async () => { calls++; return { rejected: [] }; } }, fresh, fresh.recipients[0], fresh, 'initial');
+  assert.equal(calls, 1); assert.equal(fresh.totalEmailSent, 0); assert.equal(fresh.recipients[0].deliveryStatus, 'sending');
+});
+test('scheduled worker sends due follow-ups and acknowledgements only once', async () => {
+  const owner = require('jsonwebtoken').decode(tokenA).id;
+  const old = new Date(Date.now() - 7 * 86400000);
+  const recipients = normalizeRecipients([{ email: 'due@example.com' }, { email: 'replied@example.com' }, { email: 'future@example.com' }, { email: 'followed@example.com' }])
+    .map((recipient, index) => ({ ...recipient, deliveryStatus: 'sent', sentAt: index === 2 ? new Date() : old, replied: index === 1 ? 1 : 0, ...(index === 1 ? { replyMessageId: '<reply@example.com>', messageId: '<original@example.com>' } : {}), ...(index === 3 ? { followUpStatus: 'sent' } : {}) }));
+  const campaign = await Campaign.create({ userId: owner, campaignName: 'Scheduled', description: 'Worker test', ...fields, recipients, totalEmailSent: 4, status: 'sent', hasFollowUp: true, followUpDuration: 3, isAutomatedReply: true });
+  await FollowUp.create({ campaignId: String(campaign._id), ...fields });
+  await Reply.create({ campaignId: String(campaign._id), ...fields });
+  const sent = [];
+  const transporter = { sendMail: async options => { sent.push(options); return { rejected: [] }; } };
+  await runJobs({ transporter, checkInbox: async () => {} });
+  await runJobs({ transporter, checkInbox: async () => {} });
+  assert.equal(sent.filter(mail => mail.to === 'due@example.com').length, 1);
+  assert.equal(sent.filter(mail => mail.to === 'replied@example.com').length, 1);
+  assert.equal(sent.filter(mail => ['future@example.com', 'followed@example.com'].includes(mail.to)).length, 0);
+  const fresh = await Campaign.findById(campaign._id);
+  assert.equal(fresh.totalEmailSent, 4);
+  assert.equal(fresh.recipients[0].followUpStatus, 'sent');
+  assert.equal(fresh.recipients[1].autoReplySent, true);
+  assert.equal(sent.find(mail => mail.to === 'replied@example.com').inReplyTo, '<reply@example.com>');
+});
+test('scheduled worker respects another invocation’s lease', async () => {
+  const JobLock = require('../models/JobLock');
+  await JobLock.updateOne({ _id: 'mail-jobs' }, { $set: { owner: 'another-worker', expiresAt: new Date(Date.now() + 60000) } }, { upsert: true });
+  let calls = 0;
+  const result = await runJobs({ transporter: { sendMail: async () => { calls++; } }, checkInbox: async () => {} });
+  assert.equal(result.skipped, true); assert.equal(calls, 0);
+});
+test('auth requests are throttled with persistent counters', async () => {
+  let limited = false;
+  for (let index = 0; index < 31; index++) {
+    const response = await request('/api/auth/login', 'POST', { email: 'invalid', password: 'short' });
+    if (response.status === 429) { limited = true; assert.ok(Number(response.headers.get('retry-after')) > 0); break; }
+  }
+  assert.equal(limited, true);
+});
+test('database reconnects after a closed cached connection', async () => {
+  await mongoose.disconnect();
+  await require('../config/db')();
+  assert.equal((await request('/templates/total', 'GET', undefined, tokenA)).status, 200);
+});

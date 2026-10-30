@@ -10,7 +10,7 @@ const authMiddleware = require("../middlewares/authMiddleware");
 const router = express.Router();
 
 router.post("/enableAutomation", authMiddleware, enableAutomatedReply);
-router.get("/removeAutomation/:id", authMiddleware, removeAutomatedReply);
+router.delete("/removeAutomation/:id", authMiddleware, removeAutomatedReply);
 router.get(
   "/getAutomationByCompaignId/:id",
   authMiddleware,

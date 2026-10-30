@@ -1,3 +1,7 @@
 .qodo
 /node_modules
 .env
+.env.*
+!.env.example
+.cache/
+coverage/

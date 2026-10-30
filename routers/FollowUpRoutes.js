@@ -10,7 +10,7 @@ const authMiddleware = require("../middlewares/authMiddleware");
 const router = express.Router();
 
 router.post("/enableFollowUp", authMiddleware, enableFollowUp);
-router.get("/removeFollowUp/:id", authMiddleware, removeFollowUp);
+router.delete("/removeFollowUp/:id", authMiddleware, removeFollowUp);
 router.get(
   "/getFollowUpByCompaignId/:id",
   authMiddleware,

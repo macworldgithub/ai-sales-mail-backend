@@ -1,16 +1,10 @@
-const mongoose = require("mongoose");
-
-const connectDB = async () => {
-  try {
-    await mongoose.connect(process.env.MONGO_URI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-    });
-    console.log("MongoDB Connected");
-  } catch (error) {
-    console.error("MongoDB Connection Error:", error);
-    process.exit(1);
-  }
+const mongoose = require('mongoose');
+mongoose.set('bufferCommands', false);
+let connectionPromise;
+module.exports = async function connectDB() {
+  if (mongoose.connection.readyState === 1) return mongoose;
+  if (!process.env.MONGO_URI) throw new Error('MONGO_URI is required');
+  if (!connectionPromise) connectionPromise = mongoose.connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 8000, maxPoolSize: 5 })
+    .then(connection => { connectionPromise = undefined; return connection; }, error => { connectionPromise = undefined; throw error; });
+  return connectionPromise;
 };
-
-module.exports = connectDB;
