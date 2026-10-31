@@ -2,6 +2,10 @@
 
 Express / MongoDB backend for personalized email campaigns, tracking, automated replies and scheduled follow-ups.
 
+Recipient personalization is resolved when mail is sent, including scheduled campaigns, replies, and follow-ups. Missing or blank fields (including `N/A`) use a neutral greeting and omit sentences that depend on unavailable details. Names, company names, and designations are never invented. Optional phrases can use `{{Company|your organization}}`. Field names support common case, spacing, and naming variants such as `First Name`, `first_name`, and `Designation`/`Job Title`.
+
+The authenticated `POST /email/preview` endpoint accepts `subject`, `body`, `closing`, and one spreadsheet `recipient`; it returns `emailContent` and `missingFields` using the same renderer as delivery, without sending mail. The frontend Review step uses it to preview each recipient. Sender signatures use `{{Sender Email}}` and optionally `{{Sender Name}}`; configure `EMAIL_FROM_NAME` for a display name. Recipient identity placeholders are omitted from signature-only lines after a sign-off so the recipient is not mistaken for the sender.
+
 ## Production VPS deployment
 
 Use [DEPLOYMENT.md](DEPLOYMENT.md) for the complete PM2 and Nginx deployment procedure.

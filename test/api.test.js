@@ -75,7 +75,22 @@ test('validates recipient imports and safe placeholder substitution', () => {
   assert.equal(recipient.opened, 0); assert.equal(recipient.deliveryStatus, 'pending');
   assert.equal(personalize('Hello {{First Name}}', recipient), 'Hello $& <script>');
   assert.ok(mailContent(fields, recipient, '123').html.includes('&lt;script&gt;'));
-  assert.equal(personalize('{{missing}}', recipient), '{{missing}}');
+  assert.equal(personalize('{{missing}}', recipient), '');
+});
+
+test('authenticated previews use the delivery renderer and never send mail', async () => {
+  const data = { subject: 'An offer for {{First Name}}', body: 'Dear {{First Name}},\n\nWe can help your team. Your designation is {{Designation}}.', closing: 'Best regards,\n{{First Name}}', recipient: { Email: 'client@example.com', 'First Name': '' } };
+  assert.equal((await request('/email/preview', 'POST', data)).status, 401);
+  assert.equal((await request('/email/preview', 'POST', { ...data, recipient: { Email: 'bad' } }, tokenA)).status, 400);
+  const response = await request('/email/preview', 'POST', data, tokenA);
+  assert.equal(response.status, 200);
+  assert.equal(response.data.emailContent.subject, 'An offer');
+  assert.equal(response.data.emailContent.body, 'Hello,\n\nWe can help your team.');
+  assert.equal(response.data.emailContent.closing, 'Best regards,\nsender@example.com');
+  const [recipient] = normalizeRecipients([data.recipient]);
+  const content = mailContent({ emailTemplateSubject: data.subject, emailTemplateBody: data.body, emailTemplateClosing: data.closing }, recipient, 'preview');
+  assert.equal(content.text, response.data.emailContent.body + '\n\n' + response.data.emailContent.closing);
+  assert.deepEqual(response.data.missingFields, ['First Name', 'Designation']);
 });
 test('campaign creation is idempotent and scoped to its owner', async () => {
   assert.equal((await request('/campaigns/create', 'POST', { ...campaignData, recipients: [] }, tokenA)).status, 400);

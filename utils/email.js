@@ -1,5 +1,6 @@
 const crypto = require('node:crypto');
 const { fail } = require('./http');
+const { personalize, renderEmail } = require('./personalization');
 function normalizeRecipients(rows) {
   if (!Array.isArray(rows) || !rows.length || rows.length > 1000) fail(400, 'Upload between 1 and 1000 recipients');
   const seen = new Set();
@@ -14,10 +15,6 @@ function normalizeRecipients(rows) {
     return { data, email, opened: 0, replied: 0, sentAt: null, updatedAt: null, deliveryStatus: 'pending', attempts: 0, autoReplySent: false };
   });
 }
-function personalize(template, recipient) {
-  const values = { ...recipient.data, email: recipient.email };
-  return template.replace(/{{\s*([^{}]+?)\s*}}/g, (match, key) => Object.hasOwn(values, key) ? String(values[key]) : match);
-}
 const escapeHtml = value => value.replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 function trackingToken(campaignId, email) {
   return crypto.createHmac('sha256', process.env.TRACKING_SECRET).update(`${campaignId}:${email.toLowerCase()}`).digest('hex');
@@ -27,9 +24,7 @@ function validTrackingToken(campaignId, email, token) {
   return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(trackingToken(campaignId, email)));
 }
 function mailContent(template, recipient, campaignId) {
-  const subject = personalize(template.emailTemplateSubject, recipient).replace(/[\r\n]/g, ' ');
-  const body = personalize(template.emailTemplateBody, recipient);
-  const closing = personalize(template.emailTemplateClosing, recipient);
+  const { subject, body, closing } = renderEmail(template, recipient, { name: process.env.EMAIL_FROM_NAME, email: process.env.EMAIL_USER });
   const query = new URLSearchParams({ campaignId: String(campaignId), email: recipient.email, token: trackingToken(campaignId, recipient.email) });
   return { subject, text: `${body}\n\n${closing}`, html: `<p>${escapeHtml(body).replace(/\n/g, '<br>')}</p><p>${escapeHtml(closing).replace(/\n/g, '<br>')}</p><img src="${process.env.SERVER_URL.replace(/\/$/, '')}/email/emailTracker?${query}" width="1" height="1" alt="">` };
 }

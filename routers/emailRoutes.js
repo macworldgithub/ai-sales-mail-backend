@@ -4,12 +4,14 @@ const {
   MakeChangesToEmail,
   TrackEmail,
   GenerateAutomatedEmail,
-  GenerateAutomatedFollowUpEmail
+  GenerateAutomatedFollowUpEmail,
+  PreviewEmail
 } = require("../controllers/emailGeneration");
 
 const authMiddleware = require("../middlewares/authMiddleware");
 const router = express.Router();
 router.use((req, res, next) => req.method === 'POST' ? authMiddleware(req, res, next) : next());
+router.post('/preview', require('../middlewares/rateLimit')('preview', 120, 60000), PreviewEmail);
 router.use((req, res, next) => req.method === 'POST' ? require('../middlewares/rateLimit')('ai', 60, 3600000)(req, res, next) : next());
 
 router.post("/generate", authMiddleware, GenerateEmail);
