@@ -7,6 +7,8 @@ The API listens on **127.0.0.1:5921**. Nginx serves both:
 
 The deployment uses your existing Node.js, npm, Git, PM2, Nginx, Bash and standard Linux tools. It does not install system packages or global npm packages. Production application dependencies are installed from the lockfile in each new release using `npm ci --omit=dev`. Supported runtimes are Node.js 22.12+ and Node.js 24.
 
+When the server's default Node version is older, an existing app-local runtime at `.runtime/node/bin/node` is selected automatically, including its npm and the PM2 app interpreter. This leaves the system runtime and other PM2 applications unchanged. The deployment script does not download or install this runtime.
+
 ## First deployment
 
 Point the A records for both hostnames to your VPS. If you publish AAAA records, they must point to the working IPv6 address of this same server. Allow incoming HTTP/HTTPS; the Node port remains bound to loopback.

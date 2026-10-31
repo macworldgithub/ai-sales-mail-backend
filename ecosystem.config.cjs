@@ -3,7 +3,7 @@ const root = process.env.APP_ROOT || __dirname;
 const logs = process.env.APP_LOG_DIR || path.join(__dirname, 'logs');
 const common = {
   cwd: root,
-  interpreter: process.execPath,
+  interpreter: process.env.NODE_BINARY || process.execPath,
   exec_mode: 'fork',
   instances: 1,
   autorestart: true,

@@ -4,6 +4,10 @@ set -Eeuo pipefail
 umask 027
 
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# Prefer an existing app-local runtime without changing other PM2 applications.
+if [[ -x "$PROJECT_DIR/.runtime/node/bin/node" ]]; then
+  export PATH="$PROJECT_DIR/.runtime/node/bin:$PATH"
+fi
 DEPLOY_ROOT="${DEPLOY_ROOT:-$PROJECT_DIR/.deploy}"
 ENV_FILE="${ENV_FILE:-$PROJECT_DIR/.env}"
 DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
@@ -175,6 +179,7 @@ switch_release() {
 pm2_apply() {
   local directory="$1" id="$2" only="$3"
   APP_ROOT="$CURRENT" APP_LOG_DIR="$DEPLOY_ROOT/logs" RELEASE_ID="$id" \
+    NODE_BINARY="$(command -v node)" \
     pm2 startOrReload "$directory/ecosystem.config.cjs" --only "$only" --env production --update-env
 }
 rollback_on_error() {
