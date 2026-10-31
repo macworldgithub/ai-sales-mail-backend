@@ -255,12 +255,17 @@ done
 say 'Reloading Nginx and checking both hostnames'
 "${SUDO[@]}" "$NGINX_BIN" -s reload
 for hostname in "$DOMAIN" "$WWW_DOMAIN"; do
-  if (( TLS )); then
-    curl --silent --show-error --fail --connect-timeout 5 --max-time 15 --resolve "$hostname:443:127.0.0.1" "https://$hostname/ready" > "$BACKUP_DIR/proxy-ready.json"
-  else
-    curl --silent --show-error --fail --connect-timeout 5 --max-time 15 -H "Host: $hostname" http://127.0.0.1/ready > "$BACKUP_DIR/proxy-ready.json"
-  fi
-  node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(process.argv[1])); process.exit(r.status==="ready" && r.release===process.argv[2] ? 0 : 1)' "$BACKUP_DIR/proxy-ready.json" "$RELEASE_ID"
+  PROXY_READY=0
+  # Nginx acknowledges reload before its new workers accept requests.
+  # Allow the old workers to drain before deciding activation failed.
+  for ((attempt=1; attempt<=HEALTH_ATTEMPTS; attempt++)); do
+    proxy_args=(-H "Host: $hostname" http://127.0.0.1/ready)
+    if (( TLS )); then proxy_args=(--resolve "$hostname:443:127.0.0.1" "https://$hostname/ready"); fi
+    if curl --silent --show-error --fail --connect-timeout 5 --max-time 15 "${proxy_args[@]}" > "$BACKUP_DIR/proxy-ready.json" 2> "$BACKUP_DIR/proxy-error.log" && \
+      node -e 'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(process.argv[1])); process.exit(r.status==="ready" && r.release===process.argv[2] ? 0 : 1)' "$BACKUP_DIR/proxy-ready.json" "$RELEASE_ID"; then PROXY_READY=1; break; fi
+    sleep "$HEALTH_RETRY_SECONDS"
+  done
+  [[ "$PROXY_READY" == 1 ]] || { printf 'Proxy readiness failed for %s.\n' "$hostname" >&2; false; }
 done
 
 if (( TLS )); then

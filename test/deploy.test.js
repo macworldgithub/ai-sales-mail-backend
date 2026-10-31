@@ -14,7 +14,7 @@ test('deployment stages releases and restores the last release after Nginx or re
   const bin = path.join(fixture, 'bin');
   fs.mkdirSync(source); fs.mkdirSync(bin);
   const stateFile = path.join(fixture, 'state.json');
-  fs.writeFileSync(stateFile, '{}');
+  fs.writeFileSync(stateFile, '{"failProxyOnce":true}');
   fs.copyFileSync(path.join(root, 'deploy.sh'), path.join(source, 'deploy.sh'));
   fs.copyFileSync(path.join(root, 'ecosystem.config.cjs'), path.join(source, 'ecosystem.config.cjs'));
   fs.cpSync(path.join(root, 'deploy'), path.join(source, 'deploy'), { recursive: true });
@@ -47,6 +47,7 @@ if(command==='nginx'){
 }
 if(command==='curl'){
  const release=s.apps['ai-sales-mail-api']?.pm2_env.RELEASE_ID;
+ if(!args.some(x=>x.includes(':5921/ready')) && s.failProxyOnce){s.failProxyOnce=false;save(s);process.exit(22);}
  if(s.failReady && release!==s.initialRelease)process.exit(22);
  console.log(JSON.stringify({status:'ready',release}));process.exit(0);
 }
@@ -88,6 +89,7 @@ throw Error('Unknown stub command');`;
   const site = path.join(fixture, 'nginx-available/ai-sales-mail-backend');
   const bootstrap = invoke('--no-pull', '--http');
   success(bootstrap);
+  assert.equal(state().failProxyOnce, false);
   assert.equal(state().apps['ai-sales-mail-worker'], undefined);
   fs.mkdirSync(path.join(fixture, 'tls'), { recursive: true });
   fs.writeFileSync(path.join(fixture, 'tls/fullchain.pem'), 'fixture certificate');
