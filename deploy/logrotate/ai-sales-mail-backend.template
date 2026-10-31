@@ -1,0 +1,11 @@
+__LOG_GLOB__ {
+    daily
+    maxsize 10M
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su __DEPLOY_USER__ __DEPLOY_GROUP__
+}

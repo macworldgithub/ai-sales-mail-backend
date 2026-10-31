@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const mongoose = require('mongoose');
 const { MongoMemoryServer } = require('mongodb-memory-server-core');
 let mongo, server, base, tokenA, tokenB, campaignId, templateId;
+process.env.NODE_ENV = 'test';
 process.env.JWT_SECRET = 'isolated-test-jwt-secret';
 process.env.CRON_SECRET = 'isolated-test-cron-secret';
 process.env.TRACKING_SECRET = 'isolated-test-tracking-secret';
@@ -43,6 +44,7 @@ before(async () => {
 after(async () => { if (server) await new Promise(resolve => server.close(resolve)); await mongoose.disconnect(); if (mongo) await mongo.stop(); });
 test('health, allowed preflight and disallowed origins', async () => {
   assert.equal((await request('/health')).status, 200);
+  assert.equal((await request('/ready')).status, 200);
   const preflight = await request('/campaigns/create', 'OPTIONS', undefined, undefined, { Origin: 'http://localhost:5173', 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'authorization,idempotency-key' });
   assert.equal(preflight.status, 204);
   assert.equal(preflight.headers.get('access-control-allow-origin'), 'http://localhost:5173');
@@ -51,6 +53,7 @@ test('health, allowed preflight and disallowed origins', async () => {
   assert.equal((await request('/api/cron/status')).status, 401);
   const schedulerStatus = await request('/api/cron/status', 'GET', undefined, process.env.CRON_SECRET);
   assert.equal(schedulerStatus.status, 200);
+  assert.equal((await request('/api/cron/process', 'GET', undefined, process.env.CRON_SECRET)).status, 409);
 });
 test('validates auth, normalizes email and expires tokens', async () => {
   assert.equal((await request('/api/auth/signup', 'POST', { email: {}, password: 'short' })).status, 400);

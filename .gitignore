@@ -5,3 +5,5 @@
 !.env.example
 .cache/
 coverage/
+.deploy/
+logs/

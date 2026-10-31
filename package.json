@@ -4,9 +4,12 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "dev": "nodemon index.js",
-    "start": "node index.js",
-    "test": "node --test --test-concurrency=1"
+    "dev": "nodemon server.js",
+    "start": "node server.js",
+    "test": "node --test --test-concurrency=1",
+    "worker": "node worker.js",
+    "check:config": "node scripts/check-config.js",
+    "preflight": "node scripts/preflight.js"
   },
   "keywords": [],
   "author": "",
@@ -29,6 +32,6 @@
     "mongodb-memory-server-core": "^11.3.0"
   },
   "engines": {
-    "node": "22.x"
+    "node": "^22.12.0 || ^24.0.0"
   }
 }

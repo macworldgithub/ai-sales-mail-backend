@@ -135,4 +135,4 @@ async function runJobs({ transporter: providedTransport, checkInbox = checkRepli
     await JobLock.updateOne({ _id: 'mail-jobs', owner }, { $set: { expiresAt: new Date(0), lastRunAt: new Date() } });
   }
 }
-module.exports = { runJobs, deliver };
+module.exports = { runJobs, deliver, transport };

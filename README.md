@@ -1,58 +1,84 @@
 # AI SalesMail API
 
-Node.js 22 / Express / MongoDB API. Each signed-in user owns their campaigns and templates. Existing records without an owner are hidden until explicitly migrated.
+Express / MongoDB backend for personalized email campaigns, tracking, automated replies and scheduled follow-ups.
 
-## Local setup
+## Production VPS deployment
 
-1. Run `npm ci`.
-2. Copy `.env.example` to `.env` and fill in your settings.
-3. For local development, set `FRONTEND_URL=http://localhost:5173` and `SERVER_URL=http://localhost:3000`. Start MongoDB and run `npm run dev`.
-4. Open `http://localhost:3000/health`.
+Use [DEPLOYMENT.md](DEPLOYMENT.md) for the complete PM2 and Nginx deployment procedure.
 
-Required configuration:
-- `MONGO_URI`: MongoDB connection string.
-- `JWT_SECRET`: a long random signing secret.
-- `FRONTEND_URL`: comma-separated exact frontend origins (no paths), including localhost for development.
-- `SERVER_URL`: public backend origin, without a path. Tracking links use this origin.
-- `EMAIL_USER` and `EMAIL_PASS`: the configured sender mailbox and its app password.
-- `TRACKING_SECRET`: a separate long random secret for tracking signatures.
-- `CRON_SECRET`: a separate random secret protecting scheduled processing.
+- API: `127.0.0.1:5921`
+- Public API: `https://ai-sales-backend.omnisuiteai.com`
+- Alias: `https://www.ai-sales-backend.omnisuiteai.com`
+- PM2: one API process and one persistent worker.
+- Scheduler: the worker checks due campaigns every minute.
+- Deployment: `bash deploy.sh` for first deployment and later updates.
+- Rollback: `bash deploy.sh --rollback`.
+- Existing server tools are used; no system packages, global dependencies or Docker are installed.
 
-Optional configuration:
+The deployment script stages committed source in isolated release directories, installs only production application dependencies, verifies MongoDB/indexes and SMTP authentication without sending mail, configures and symlinks Nginx, validates readiness, saves PM2 state and configures log rotation. See the deployment guide for HTTPS bootstrap and migration from Vercel.
+
+## Configuration
+
+Copy `.env.example` to `.env` and fill in MongoDB, mailbox credentials, and distinct JWT, tracking and cron secrets. Keep the same secrets when migrating an existing deployment so tokens and signed tracking links remain valid. Private environment files are ignored by Git.
+
+Required variables: `MONGO_URI`, `JWT_SECRET`, `TRACKING_SECRET`, `CRON_SECRET`, `FRONTEND_URL`, `SERVER_URL`, `EMAIL_USER`, `EMAIL_PASS`.
+
+The example already sets production defaults for port 5921, loopback binding, the VPS domain, trusted loopback proxy, a one-minute worker interval and disabled external cron.
+
+Optional provider settings:
+
 - `SMTP_HOST`, `SMTP_PORT` (465 for implicit TLS, 587 for STARTTLS), `IMAP_HOST`.
-- `AI_API_KEY`, `AI_BASE_URL`, `AI_MODEL`: an OpenAI-compatible chat completion provider. The default URL is xAI. Choose a model available to your account; no model is silently assumed. Manual email templates work without AI.
+- `AI_API_KEY`, `AI_BASE_URL`, `AI_MODEL` for an OpenAI-compatible chat-completion provider. The default endpoint is xAI. Templates can be entered manually without AI.
 
-The old hardcoded provider credential has been removed. Revoke it in the provider dashboard, since deletion from source does not revoke it or remove it from Git history. Do not put mailbox credentials or AI keys in the frontend.
+## Local development
 
-## Deploy on Vercel
+Use Node.js 22.12+ or 24. Run `npm ci`, fill in `.env`, and set local values:
 
-Import this repository as a separate Vercel project. If importing the parent workspace, use `ai-sales-mail-backend` as the Root Directory. Use the Express framework and Node.js 22. The root `index.js` exports the Express application; it only listens on a port during local execution. Vercel uses its native Express integration, so no legacy builds/routes configuration is needed.
+```dotenv
+NODE_ENV=development
+HOST=127.0.0.1
+PORT=5921
+SERVER_URL=http://localhost:5921
+FRONTEND_URL=http://localhost:5173
+```
 
-Add all required environment variables in Vercel, then deploy. Set `FRONTEND_URL=https://ai-sales-mail-frontend.vercel.app` and `SERVER_URL=https://ai-sales-mail-backend-ten.vercel.app`. These deployment URLs are already filled in both backend environment files. If your deployment URLs are not known initially, update the values and redeploy after both projects exist. Preview frontend origins must be explicitly included to use the backend. Configure your MongoDB provider to allow connections from your deployment and use a dedicated database user.
+Run `npm run dev` for the API and `npm run worker` separately for background mail processing. Point the frontend's `VITE_API_URL` to `http://localhost:5921` when using the local API.
 
-Use Fluid compute with a function duration of 300 seconds (the documented default). Background work finishes within the request; the job worker limits its processing window and sends at most 25 messages per invocation. There are no background timers or unawaited email tasks.
+Useful commands:
 
-Campaigns can be sent now or assigned a date and time. The API stores chosen times as UTC and never claims an initial email before its campaign is due. A queued campaign can be rescheduled until delivery starts. Authenticated `POST /campaigns/:id/process` processes only the signed-in user’s requested campaign, so “Send now” starts a bounded delivery batch without waiting for cron. Each batch handles at most 25 messages; later batches continue through the scheduler.
+```sh
+npm run check:config
+npm run preflight
+npm start
+npm run worker
+npm test
+```
 
-The GitHub Actions workflow `.github/workflows/process-mail.yml` calls `GET /api/cron/process` every five minutes. Add a repository Actions secret named `CRON_SECRET` whose value exactly matches the backend Vercel variable. The secret is passed in the Authorization header and is never committed. Enable Actions for the backend repository. You can also run the workflow from its Actions page. `GET /api/cron/status` with the same bearer secret verifies authentication and shows the most recent worker completion without triggering any mail.
+`preflight` checks configuration, creates declared MongoDB indexes, and verifies database and SMTP access without sending mail. It uses the configured environment; run it against the intended database. Production disables automatic index creation during normal API/worker startup; deployment performs that step explicitly.
 
-The existing once-daily Vercel cron remains a fallback compatible with Hobby. The selected GitHub schedule works while the browser is closed, but GitHub can delay or drop scheduled runs during busy periods; this is approximate delivery, not an exact-time guarantee. A campaign is eligible at its chosen time and starts on the next available worker run. In inactive public repositories GitHub may disable scheduled workflows; check the Actions page if processing stops. Keep backend deployment protection compatible with scheduled calls and public tracking pixels. See [GitHub scheduled workflow documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule) and [Vercel Hobby cron limits](https://vercel.com/docs/cron-jobs/usage-and-pricing).
+## Campaign delivery
 
-The queue persists in MongoDB. The worker holds a database lease to prevent overlapping runs. Failed sends retry at most three times. A send interrupted after SMTP acceptance remains in a `sending` state and eventually shows `attention`; review the mailbox and that recipient's database state before retrying. SMTP cannot guarantee exactly-once delivery when acceptance is ambiguous. Never reset every recipient indiscriminately.
+Each signed-in user owns their campaigns and templates. A campaign can send now or store a future UTC `scheduledAt`; the worker never claims an initial email before that time. Owners can change queued campaign schedules until delivery starts. `POST /campaigns/:id/process` handles only the owner's requested campaign for immediate delivery.
 
-Reply matching uses the original sent message ID plus the sender address, rather than a tracking image in quoted HTML. It examines up to 50 unread messages from the last 30 days per invocation, marks only matched messages as read, and avoids responding to automatic messages. Use a dedicated sender inbox and keep campaign replies unread until processed. One automated acknowledgement and one follow-up are sent per recipient. Follow-ups go only to recipients who have not replied after the configured number of days. Mail-provider policies and outbound SMTP/IMAP availability still need a live deployment check.
+Mail batches are limited to 25 attempts. Database leases and atomic recipient claims prevent overlapping workers from claiming the same message. Definitive failures retry at most three times. If SMTP acceptance is uncertain, the recipient remains held for review; inspect the sender mailbox before manually retrying. Code rollback does not reverse already sent messages.
 
-## Tests
+Reply matching uses the original message ID and recipient address. The worker examines up to 50 unread messages from the last 30 days, marks only matched messages as read, and skips automatic messages. Use a dedicated sender inbox and leave replies unread until processed. Each recipient can receive one automated acknowledgement and one follow-up. Follow-ups go only to recipients who have not replied after the configured delay.
 
-Run `npm test` for isolated integration tests. They start a temporary MongoDB instance, exercise HTTP endpoints, validate ownership and tracking, and use a fake mail transport; they do not send real mail or call AI. The first run downloads MongoDB to `.cache/mongodb`. Network access is required for that first download.
+## Compatibility and migration
 
-## Legacy data
+`index.js` continues to export the Express app for the previous Vercel deployment. Server processes use `server.js`; PM2 manages `worker.js` on the VPS. External cron processing is disabled on the PM2 production configuration. The legacy GitHub workflow and Vercel configuration are retained so the existing backend can continue operating during migration; disable their scheduled triggers after the VPS is healthy, as described in DEPLOYMENT.md.
 
-No records are claimed automatically. For a database previously used by one owner:
+Existing records without an owner remain hidden until explicitly migrated. For a legacy database belonging to a single owner:
 
 ```sh
 node scripts/claim-legacy-data.js --user-email owner@example.com
 node scripts/claim-legacy-data.js --user-email owner@example.com --apply
 ```
 
-The first command is a dry run. Back up the database and verify the counts and owner before using `--apply`. For a database shared by multiple people, assign records individually after identifying their owners; do not use this bulk script. Historical mail lacks the new message IDs and signed tracking links, so reliable reply matching and signed open tracking apply to newly sent mail.
+The first command is a dry run. Back up the database and verify the counts and owner before applying. For a database shared by multiple people, assign records individually after identifying their owners. Historical mail may lack the new message IDs and signed tracking links.
+
+## Tests
+
+`npm test` runs isolated integration and runtime tests. They use a temporary MongoDB database, fake mail transport, and fake background jobs. They do not send real emails or call AI. The first run downloads a MongoDB binary into `.cache/mongodb`.
+
+Bash syntax can be checked with `bash -n deploy.sh`. The deployment itself runs the server's real `nginx -t`, configuration checks, database/SMTP preflight, and direct/proxied readiness checks.
