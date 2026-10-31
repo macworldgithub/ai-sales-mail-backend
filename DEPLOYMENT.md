@@ -141,8 +141,8 @@ The public `/health` endpoint reports whether the API responds. `/ready` reports
 
 After HTTPS and readiness pass on the VPS:
 
-1. Set the frontend Vercel variable `VITE_API_URL=https://ai-sales-backend.omnisuiteai.com` and redeploy the frontend. Vite embeds this value at build time. The example configuration targets the VPS; the existing source fallback keeps the previous Vercel API until this explicit cutover.
-2. Disable the old backend repository's **Process scheduled mail** GitHub Actions workflow and the old backend project's Vercel cron. This prevents the previous Vercel backend from continuing to process this database. The VPS worker replaces both schedulers.
+1. Set the frontend Vercel variable `VITE_API_URL=https://ai-sales-backend.omnisuiteai.com` and redeploy the frontend. Vite embeds this value at build time. The example and source fallback target the VPS; an existing Vercel environment variable overrides the fallback.
+2. Disable the old backend repository's **Process scheduled mail** GitHub Actions workflow. Vercel cron has been removed from `vercel.json`; redeploy the old Vercel backend to apply that removal if it is still active. This prevents the previous Vercel backend from continuing to process this database. The VPS worker replaces both schedulers.
 3. Keep the previous tracking endpoint available if existing emails link to the old Vercel hostname, or arrange a redirect/proxy from it to the new API. Preserve `TRACKING_SECRET` for existing signatures. New messages use the VPS `SERVER_URL`.
 
 ## Optional path settings
