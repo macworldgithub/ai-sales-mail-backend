@@ -68,9 +68,9 @@ test('validates auth, normalizes email and expires tokens', async () => {
   assert.equal((await request('/campaigns/getAll')).status, 401);
 });
 test('validates recipient imports and safe placeholder substitution', () => {
-  assert.throws(() => normalizeRecipients([]), /between 1 and 1000/);
+  assert.throws(() => normalizeRecipients([]), /between 1 and 10000/);
   assert.throws(() => normalizeRecipients([{ email: 'bad' }]), /Invalid email/);
-  assert.throws(() => normalizeRecipients([{ email: 'a@b.com' }, { Email: 'A@B.com' }]), /Duplicate/);
+  assert.equal(normalizeRecipients([{ email: 'a@b.com' }, { Email: 'A@B.com' }]).length, 1);
   const [recipient] = normalizeRecipients([{ Email: 'A@b.com', 'First Name': '$& <script>', opened: 1, deliveryStatus: 'sent' }]);
   assert.equal(recipient.opened, 0); assert.equal(recipient.deliveryStatus, 'pending');
   assert.equal(personalize('Hello {{First Name}}', recipient), 'Hello $& <script>');
@@ -235,6 +235,76 @@ test('manual processing is scoped to the requested user and campaign', async () 
   assert.equal(sends, 1);
   assert.equal((await Campaign.findById(b.data.campaign._id)).totalEmailSent, 0);
 });
+test('lead imports skip missing emails and duplicates and personalize Client name', () => {
+  const rows = normalizeRecipients([{ 'Client name': 'Ignored', 'Client email\t': '-' }, { 'Client name': 'Alice Jones', 'Client email\t': ' ALICE@example.com ' }, { 'Client name': 'Duplicate', 'Client email': 'alice@example.com' }, { 'Client name': 'Bob', 'Client email': '' }]);
+  assert.equal(rows.length, 1); assert.equal(rows[0].email, 'alice@example.com');
+  assert.equal(personalize('Hi {{Client Name}},', rows[0]), 'Hi Alice Jones,');
+  assert.throws(() => normalizeRecipients([{ 'Client email': '-' }]), /No recipients/);
+});
+
+test('chunk settings are validated and timed gaps survive repeated processing and database reads', async () => {
+  for (const config of [{ chunkSize: 0, chunkGapSeconds: 60 }, { chunkSize: 1001, chunkGapSeconds: 60 }, { chunkSize: 1.5, chunkGapSeconds: 60 }, { chunkSize: 50, chunkGapSeconds: 0 }]) {
+    assert.equal((await request('/campaigns/create', 'POST', { ...campaignData, ...config }, tokenA)).status, 400);
+  }
+  const recipients = Array.from({ length: 5 }, (_, i) => ({ Email: `chunk${i}@example.com` }));
+  const created = await request('/campaigns/create', 'POST', { ...campaignData, recipients, chunkSize: 2, chunkGapSeconds: 600 }, tokenA);
+  assert.equal(created.status, 201);
+  const id = created.data.campaign._id, sent = [];
+  const transporter = { sendMail: async mail => { sent.push(mail.to); return { rejected: [] }; } };
+  const run = () => runJobs({ campaignId: id, includeAutomation: false, transporter });
+  await run();
+  assert.deepEqual(sent, ['chunk0@example.com', 'chunk1@example.com']);
+  let fresh = await Campaign.findById(id);
+  assert.equal(fresh.currentChunk, 1); assert.ok(fresh.nextChunkAt > new Date(Date.now() + 590000));
+  await run(); assert.equal(sent.length, 2);
+  assert.equal((await request(`/campaigns/${id}/process`, 'POST', {}, tokenA)).status, 202);
+  await deliver(transporter, fresh, fresh.recipients[2], fresh, 'initial'); assert.equal(sent.length, 2);
+  await Campaign.updateOne({ _id: id }, { $set: { nextChunkAt: new Date(Date.now() - 1000) } });
+  await run(); assert.equal(sent.length, 4);
+  fresh = await Campaign.findById(id); assert.equal(fresh.currentChunk, 2); assert.ok(fresh.nextChunkAt > new Date());
+  await run(); assert.equal(sent.length, 4);
+  await Campaign.updateOne({ _id: id }, { $set: { nextChunkAt: new Date(Date.now() - 1000) } });
+  await run(); assert.equal(new Set(sent).size, 5); assert.equal((await Campaign.findById(id)).status, 'sent');
+});
+
+test('a partial chunk retries only failed recipients before advancing and waits for its gap', async () => {
+  const created = await request('/campaigns/create', 'POST', { ...campaignData, recipients: [{ Email: 'good@example.com' }, { Email: 'reject@example.com' }, { Email: 'next@example.com' }], chunkSize: 2, chunkGapSeconds: 300 }, tokenA);
+  const id = created.data.campaign._id, sent = [];
+  const transporter = { sendMail: async mail => { sent.push(mail.to); if (mail.to === 'reject@example.com') { const error = new Error('Rejected'); error.responseCode = 550; throw error; } return { rejected: [] }; } };
+  const run = () => runJobs({ campaignId: id, includeAutomation: false, transporter });
+  await run(); let fresh = await Campaign.findById(id); assert.equal(fresh.currentChunk, 0); assert.equal(fresh.nextChunkAt, null);
+  await run(); fresh = await Campaign.findById(id); assert.equal(fresh.currentChunk, 0);
+  await run(); fresh = await Campaign.findById(id); assert.equal(fresh.currentChunk, 1); assert.ok(fresh.nextChunkAt > new Date());
+  await run(); assert.deepEqual(sent, ['good@example.com', 'reject@example.com', 'reject@example.com', 'reject@example.com']);
+});
+
+test('a 50-message chunk is not truncated to the old 25-message worker limit', async () => {
+  const created = await request('/campaigns/create', 'POST', { ...campaignData, recipients: Array.from({ length: 51 }, (_, i) => ({ Email: `large${i}@example.com` })), chunkSize: 50, chunkGapSeconds: 60 }, tokenA);
+  let sent = 0;
+  const result = await runJobs({ campaignId: created.data.campaign._id, includeAutomation: false, transporter: { sendMail: async () => { sent++; return { rejected: [] }; } } });
+  assert.equal(result.processed, 50); assert.equal(sent, 50);
+  const fresh = await Campaign.findById(created.data.campaign._id); assert.equal(fresh.currentChunk, 1); assert.equal(fresh.totalEmailSent, 50);
+});
+
+test('branded templates retain the signature and emit an inline MIME image with safe public previews', async () => {
+  const template = require('../data/templates/introducing-event-transportation.json');
+  const saved = await request('/templates/create', 'POST', template, tokenA); assert.equal(saved.status, 201);
+  assert.equal((await request('/templates/getById/' + saved.data.template._id, 'GET', undefined, tokenA)).data.emailSignatureId, 'event-transportation');
+  assert.equal((await request('/templates/getById/' + saved.data.template._id, 'GET', undefined, tokenB)).status, 404);
+  const [recipient] = normalizeRecipients([{ 'Client name': 'Morgan Example', 'Client email': 'morgan@example.com' }]);
+  const fields = { emailTemplateSubject: template.emailSubject, emailTemplateBody: template.emailBody, emailTemplateClosing: template.emailClosing, emailSignatureId: template.emailSignatureId };
+  const content = mailContent(fields, recipient, 'logo-test');
+  assert.ok(content.text.includes('Hi Morgan Example,')); assert.ok(content.text.includes('James Cooper (Team Lead)'));
+  assert.ok(content.html.includes('cid:event-transportation-signature@ai-sales-mail'));
+  assert.equal(content.attachments[0].contentDisposition, 'inline'); assert.ok(require('fs').existsSync(content.attachments[0].path));
+  const mime = await require('nodemailer').createTransport({ streamTransport: true, buffer: true }).sendMail({ from: 'sender@example.com', to: recipient.email, ...content });
+  assert.ok(mime.message.toString().includes('Content-ID: <event-transportation-signature@ai-sales-mail>'));
+  const preview = await request('/email/preview', 'POST', { subject: template.emailSubject, body: template.emailBody, closing: template.emailClosing, signatureId: template.emailSignatureId, recipient: recipient.data }, tokenA);
+  assert.equal(preview.status, 200); assert.ok(preview.data.signature.url.endsWith('/email/assets/event-transportation-signature.png'));
+  const image = await request('/email/assets/event-transportation-signature.png'); assert.equal(image.status, 200); assert.equal(image.headers.get('cross-origin-resource-policy'), 'cross-origin');
+  assert.equal((await request('/email/preview', 'POST', { subject: 'A', body: 'B', closing: 'C', signatureId: '../../.env', recipient: recipient.data }, tokenA)).status, 400);
+});
+
 test('scheduled worker respects another invocation’s lease', async () => {
   const JobLock = require('../models/JobLock');
   await JobLock.updateOne({ _id: 'mail-jobs' }, { $set: { owner: 'another-worker', expiresAt: new Date(Date.now() + 60000) } }, { upsert: true });

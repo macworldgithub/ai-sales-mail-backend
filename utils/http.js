@@ -10,6 +10,6 @@ function objectId(value) {
   return value;
 }
 function emailFields(body) {
-  return Object.fromEntries(['emailTemplateSubject', 'emailTemplateBody', 'emailTemplateClosing'].map(key => [key, text(body[key], key)]));
+  return { ...Object.fromEntries(['emailTemplateSubject', 'emailTemplateBody', 'emailTemplateClosing'].map(key => [key, text(body[key], key)])), emailSignatureId: require('./signatures').signatureId(body.emailSignatureId) };
 }
 module.exports = { asyncRoute, fail, text, objectId, emailFields };

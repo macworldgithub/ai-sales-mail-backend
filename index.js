@@ -15,6 +15,7 @@ app.use(cors({ origin(origin, callback) {
   const error = new Error('Origin is not allowed'); error.status = 403; callback(error);
 } }));
 app.use(express.json({ limit: '2mb' }));
+app.use('/email/assets', express.static(require('node:path').join(__dirname, 'assets', 'email'), { maxAge: '1d', setHeaders(res) { res.set('Cross-Origin-Resource-Policy', 'cross-origin'); } }));
 app.get('/', (_req, res) => res.json({ message: 'AI SalesMail API is running' }));
 app.get('/health', (_req, res) => res.set('Cache-Control', 'no-store').json({ status: 'ok' }));
 app.get('/ready', (_req, res) => res.set('Cache-Control', 'no-store').status(mongoose.connection.readyState === 1 ? 200 : 503).json({

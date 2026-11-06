@@ -6,7 +6,8 @@ exports.PreviewEmail = asyncRoute(async (req, res) => {
   const template = Object.fromEntries(['subject', 'body', 'closing'].map(key => [`emailTemplate${key[0].toUpperCase()}${key.slice(1)}`, text(req.body[key], key)]));
   const [recipient] = normalizeRecipients([req.body.recipient]);
   const { missingFields, ...emailContent } = renderEmail(template, recipient, { name: process.env.EMAIL_FROM_NAME, email: process.env.EMAIL_USER });
-  res.json({ emailContent, missingFields });
+  const signature = require('../utils/signatures').signatureFor(req.body.signatureId);
+  res.json({ emailContent, missingFields, signature: signature ? { url: signature.url, alt: signature.alt, width: signature.width, height: signature.height } : null });
 });
 function extractJson(content) {
   if (typeof content !== 'string') fail(502, 'The AI provider returned an empty response');

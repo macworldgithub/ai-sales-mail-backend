@@ -64,7 +64,19 @@ npm test
 
 Each signed-in user owns their campaigns and templates. A campaign can send now or store a future UTC `scheduledAt`; the worker never claims an initial email before that time. Owners can change queued campaign schedules until delivery starts. `POST /campaigns/:id/process` handles only the owner's requested campaign for immediate delivery.
 
-Mail batches are limited to 25 attempts. Database leases and atomic recipient claims prevent overlapping workers from claiming the same message. Definitive failures retry at most three times. If SMTP acceptance is uncertain, the recipient remains held for review; inspect the sender mailbox before manually retrying. Code rollback does not reverse already sent messages.
+Campaigns can set `chunkSize` (1–1000) and `chunkGapSeconds` (1–604800). Each chunk finishes its initial deliveries and definitive retries before the gap starts. The current chunk and next eligible send time are persisted in MongoDB, survive restarts, and are enforced by both the worker and manual processing. The worker polls every minute, so a due chunk can start later than its minimum gap. Large chunks continue across bounded worker runs; one run has a 250-attempt safety limit and time budget. Campaigns without chunk settings retain a 25-attempt limit per campaign per run.
+
+Database leases and atomic recipient claims prevent overlapping workers from claiming the same message. Definitive failures retry at most three times. If SMTP acceptance is uncertain, the recipient remains held for review; inspect the sender mailbox before manually retrying. Code rollback does not reverse already sent messages.
+
+Lead imports accept `Email` or `Client email` headers, including whitespace and common naming variants. Blank email cells and markers such as `-` are ignored; duplicate addresses are deduplicated. Nonempty malformed emails are rejected. A campaign supports up to 5,000 unique recipients from 10,000 source rows. `{{Client Name}}` uses the sheet's client name without guessing a name from the email address.
+
+The supplied template is stored in `data/templates/introducing-event-transportation.json`. Save or refresh it for a specific existing account without sending mail:
+
+```sh
+node scripts/save-event-template.js test@gmail.com
+```
+
+`emailSignatureId: "event-transportation"` enables the supplied signature. SMTP embeds the original PNG as a CID attachment at a responsive 600-pixel display width. Plain-text messages retain the contact details and closing; browser previews use the public signature asset. Signature identifiers are allowlisted; arbitrary attachment paths and URLs are not accepted.
 
 Reply matching uses the original message ID and recipient address. The worker examines up to 50 unread messages from the last 30 days, marks only matched messages as read, and skips automatic messages. Use a dedicated sender inbox and leave replies unread until processed. Each recipient can receive one automated acknowledgement and one follow-up. Follow-ups go only to recipients who have not replied after the configured delay.
 

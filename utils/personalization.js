@@ -4,7 +4,7 @@ const placeholders = /{{\s*([^{}]+?)\s*}}/g;
 const keyOf = key => key.normalize('NFKC').toLowerCase().replace(/[\s_-]+/g, '');
 const groups = [
   ['firstname', 'givenname', 'forename'], ['lastname', 'surname', 'familyname'],
-  ['name', 'fullname', 'contactname'], ['company', 'companyname', 'organization', 'organisation', 'employer'],
+  ['name', 'fullname', 'contactname', 'clientname', 'customername'], ['company', 'companyname', 'organization', 'organisation', 'employer'],
   ['jobtitle', 'designation', 'position', 'role', 'title'], ['email', 'emailaddress'],
 ];
 const absent = value => value == null || !String(value).trim() || /^(?:n\s*\/?\s*a|not\s+(?:available|provided|applicable|known)|unknown|null|undefined|none|[-–—])$/i.test(String(value).trim());

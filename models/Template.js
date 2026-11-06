@@ -7,6 +7,7 @@ const emailTemplateSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
+    emailSignatureId: { type: String, default: null },
     templatePurpose: {
       type: String,
       required: true,

@@ -2,6 +2,7 @@ const Campaign = require('../models/compaign');
 const { asyncRoute, fail, text, objectId, emailFields } = require('../utils/http');
 const { normalizeRecipients } = require('../utils/email');
 const { parseSchedule } = require('../utils/schedule');
+const { parseChunks, chunkReady } = require('../utils/chunks');
 exports.createCampaign = asyncRoute(async (req, res) => {
   if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS || !process.env.SERVER_URL || !process.env.TRACKING_SECRET) fail(503, 'Email delivery is not configured');
   const requestId = req.get('Idempotency-Key');
@@ -16,6 +17,7 @@ exports.createCampaign = asyncRoute(async (req, res) => {
     userId: req.user.id, campaignName: text(req.body.campaignName, 'Campaign name', 200),
     ...(requestId ? { requestId } : {}),
     description: text(req.body.description, 'Description', 2000), ...emailFields(req.body),
+    ...parseChunks(req.body),
     recipients: normalizeRecipients(req.body.recipients),
     scheduledAt, status: scheduledAt ? 'scheduled' : 'queued', totalEmailSent: 0, totalEmailOpened: 0, totalEmailReplied: 0,
   }); } catch (error) {
@@ -45,9 +47,10 @@ exports.processCampaign = asyncRoute(async (req, res) => {
   const campaign = await Campaign.findOne({ _id: id, userId: req.user.id });
   if (!campaign) fail(404, 'Campaign not found');
   if (campaign.scheduledAt && campaign.scheduledAt.getTime() > Date.now()) fail(409, 'This campaign is scheduled for a future time. Change its send time first.');
+  if (!chunkReady(campaign)) return res.status(202).json({ campaign, message: `The next chunk is scheduled for ${campaign.nextChunkAt.toISOString()}.` });
   const result = await require('../services/jobs').runJobs({ campaignId: id, userId: req.user.id, includeAutomation: false, timeBudgetMs: 40000 });
   const updated = await Campaign.findOne({ _id: id, userId: req.user.id }).select('-recipients -emailTemplateBody -emailTemplateClosing');
-  res.status(result.skipped ? 202 : 200).json({ ...result, campaign: updated, message: result.skipped ? 'The delivery worker is busy. Your campaign remains queued.' : updated.lastDeliveryError || (updated.status === 'sent' ? 'Campaign sent' : 'Delivery batch processed; remaining recipients stay queued') });
+  res.status(result.skipped ? 202 : 200).json({ ...result, campaign: updated, message: result.skipped ? 'The delivery worker is busy. Your campaign remains queued.' : updated.lastDeliveryError || (updated.status === 'sent' ? 'Campaign sent' : updated.nextChunkAt && updated.nextChunkAt > new Date() ? `Next chunk: ${updated.nextChunkAt.toISOString()}` : 'Delivery batch processed; remaining recipients stay queued') });
 });
 exports.getAllCampaigns = asyncRoute(async (req, res) => {
   const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);

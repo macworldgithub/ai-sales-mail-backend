@@ -2,6 +2,7 @@ const mongoose = require("mongoose");
 
 const automatedReplySchema = new mongoose.Schema(
   {
+    emailSignatureId: { type: String, default: null },
     campaignId: {
       type: String,
       required: true,

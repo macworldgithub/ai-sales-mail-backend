@@ -8,6 +8,7 @@ const FollowUp = require('../models/FollowUpEmail');
 const JobLock = require('../models/JobLock');
 const { mailContent } = require('../utils/email');
 const { dueSchedule } = require('../utils/schedule');
+const { chunkReady, inCurrentChunk, retryable, nextChunkUpdate } = require('../utils/chunks');
 function transport() {
   if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS || !process.env.TRACKING_SECRET || !process.env.SERVER_URL) throw new Error('Email delivery is not configured');
   return nodemailer.createTransport({
@@ -52,9 +53,16 @@ async function checkReplies(deadline) {
 async function deliver(transporter, campaign, recipient, template, kind) {
   const state = kind === 'initial' ? 'deliveryStatus' : kind === 'reply' ? 'replyStatus' : 'followUpStatus';
   const query = { _id: campaign._id, recipients: { $elemMatch: { email: recipient.email, [state]: { $nin: ['sending', 'sent'] } } } };
-  if (kind === 'initial') Object.assign(query, dueSchedule());
+  if (kind === 'initial') {
+    if (!chunkReady(campaign) || !inCurrentChunk(campaign, campaign.recipients.findIndex(r => r.email === recipient.email))) return false;
+    Object.assign(query, dueSchedule());
+    if (campaign.chunkSize) {
+      query.currentChunk = campaign.currentChunk || 0;
+      query.$and = [{ $or: [{ nextChunkAt: null }, { nextChunkAt: { $lte: new Date() } }] }];
+    }
+  }
   const claimed = await Campaign.updateOne(query, { $set: { [`recipients.$.${state}`]: 'sending' } });
-  if (!claimed.modifiedCount) return;
+  if (!claimed.modifiedCount) return false;
   const messageId = `<${campaign._id}.${crypto.randomUUID()}@${new URL(process.env.SERVER_URL).hostname}>`;
   // Store the message ID before SMTP so reply matching survives an interrupted request.
   if (kind === 'initial') await Campaign.updateOne({ _id: campaign._id, 'recipients.email': recipient.email }, { $set: { 'recipients.$.messageId': messageId } });
@@ -76,7 +84,7 @@ async function deliver(transporter, campaign, recipient, template, kind) {
       $set: { [`recipients.$.${state}`]: safeToRetry ? 'failed' : 'sending', 'recipients.$.lastError': safeToRetry ? reason : 'Delivery outcome is uncertain. Review the sender mailbox before retrying.' },
       $inc: { [`recipients.$.${kind}Attempts`]: 1 },
     });
-    return;
+    return true;
   }
   const now = new Date();
   const update = { $set: { [`recipients.$.${state}`]: 'sent', 'recipients.$.lastError': null } };
@@ -85,6 +93,7 @@ async function deliver(transporter, campaign, recipient, template, kind) {
   if (kind === 'reply') update.$set['recipients.$.autoReplySent'] = true;
   // A database failure after SMTP must leave "sending" for manual review, never automatic resend.
   await Campaign.updateOne({ _id: campaign._id, 'recipients.email': recipient.email }, update);
+  return true;
 }
 async function runJobs({ transporter: providedTransport, checkInbox = checkReplies, campaignId, userId, includeAutomation = true, timeBudgetMs = 180000 } = {}) {
   const owner = crypto.randomUUID();
@@ -109,16 +118,17 @@ async function runJobs({ transporter: providedTransport, checkInbox = checkRepli
       $and: [dueSchedule(), { $or: eligible }],
     }).sort({ updatedAt: 1 }).limit(25);
     for (const campaign of campaigns) {
-      if (Date.now() > deadline || processed >= 25) break;
+      if (Date.now() > deadline || processed >= 250) break;
       const reply = includeAutomation && campaign.isAutomatedReply ? await Reply.findOne({ campaignId: String(campaign._id) }).sort({ updatedAt: -1 }) : null;
       const followUp = includeAutomation && campaign.hasFollowUp ? await FollowUp.findOne({ campaignId: String(campaign._id) }).sort({ updatedAt: -1 }) : null;
-      for (const recipient of campaign.recipients) {
-        if (Date.now() > deadline || processed >= 25) break;
+      let campaignProcessed = 0;
+      for (const [index, recipient] of campaign.recipients.entries()) {
+        if (Date.now() > deadline || processed >= 250 || campaignProcessed >= (campaign.chunkSize || 25)) break;
         let kind, template;
-        if (['pending', 'failed'].includes(recipient.deliveryStatus) && (recipient.initialAttempts || 0) < 3) { kind = 'initial'; template = campaign; }
+        if (retryable(recipient) && chunkReady(campaign) && inCurrentChunk(campaign, index)) { kind = 'initial'; template = campaign; }
         else if (recipient.deliveryStatus === 'sent' && recipient.replied && !recipient.autoReplySent && recipient.replyStatus !== 'sending' && (recipient.replyAttempts || 0) < 3 && reply) { kind = 'reply'; template = reply; }
         else if (recipient.deliveryStatus === 'sent' && !recipient.replied && followUp && recipient.followUpStatus !== 'sending' && recipient.followUpStatus !== 'sent' && (recipient.followUpAttempts || 0) < 3 && new Date(recipient.sentAt).getTime() + campaign.followUpDuration * 86400000 <= Date.now()) { kind = 'followUp'; template = followUp; }
-        if (kind) { await deliver(transporter, campaign, recipient, template, kind); processed++; }
+        if (kind && await deliver(transporter, campaign, recipient, template, kind)) { processed++; campaignProcessed++; }
       }
       const fresh = await Campaign.findById(campaign._id);
       const states = fresh.recipients.map(r => r.deliveryStatus);
@@ -128,7 +138,7 @@ async function runJobs({ transporter: providedTransport, checkInbox = checkRepli
         : states.includes('sending') ? 'attention' : 'failed';
       const lastDeliveryError = [...new Set(fresh.recipients.map(r => r.lastError).filter(Boolean))].join(' ') || null;
       // Do not overwrite a schedule changed after this batch read the campaign.
-      await Campaign.updateOne({ _id: campaign._id, scheduledAt: fresh.scheduledAt || null }, { $set: { status, lastDeliveryError, lastProcessedAt: new Date() } });
+      await Campaign.updateOne({ _id: campaign._id, scheduledAt: fresh.scheduledAt || null, ...(fresh.chunkSize ? { currentChunk: fresh.currentChunk || 0 } : {}) }, { $set: { status, lastDeliveryError, lastProcessedAt: new Date(), ...nextChunkUpdate(fresh) } });
     }
     return { processed, errors };
   } finally {
