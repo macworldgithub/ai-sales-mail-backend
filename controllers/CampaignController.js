@@ -1,8 +1,16 @@
 const Campaign = require('../models/compaign');
+const JobLock = require('../models/JobLock');
 const { asyncRoute, fail, text, objectId, emailFields } = require('../utils/http');
 const { normalizeRecipients } = require('../utils/email');
 const { parseSchedule } = require('../utils/schedule');
 const { parseChunks, chunkReady } = require('../utils/chunks');
+const { mailboxHoldId, summarizeDeliveryErrors, LEGACY_REJECTION } = require('../utils/smtpFailure');
+const retryStatuses = ['failed', 'attention'];
+const rejectedRecipients = {
+  deliveryStatus: 'failed',
+  initialPermanentFailure: { $ne: true },
+  $or: [{ 'lastSmtpFailure.confirmedRejected': true }, { lastError: LEGACY_REJECTION }],
+};
 exports.createCampaign = asyncRoute(async (req, res) => {
   if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS || !process.env.SERVER_URL || !process.env.TRACKING_SECRET) fail(503, 'Email delivery is not configured');
   const requestId = req.get('Idempotency-Key');
@@ -47,17 +55,66 @@ exports.processCampaign = asyncRoute(async (req, res) => {
   const campaign = await Campaign.findOne({ _id: id, userId: req.user.id });
   if (!campaign) fail(404, 'Campaign not found');
   if (campaign.scheduledAt && campaign.scheduledAt.getTime() > Date.now()) fail(409, 'This campaign is scheduled for a future time. Change its send time first.');
+  if (campaign.smtpHold?.until > new Date()) return res.status(202).json({ smtpHold: campaign.smtpHold, message: campaign.smtpHold.reason });
   if (!chunkReady(campaign)) return res.status(202).json({ campaign, message: `The next chunk is scheduled for ${campaign.nextChunkAt.toISOString()}.` });
   const result = await require('../services/jobs').runJobs({ campaignId: id, userId: req.user.id, includeAutomation: false, timeBudgetMs: 40000 });
   const updated = await Campaign.findOne({ _id: id, userId: req.user.id }).select('-recipients -emailTemplateBody -emailTemplateClosing');
+  if (result.smtpHold) return res.status(202).json({ ...result, campaign: updated, message: result.smtpHold.reason });
   res.status(result.skipped ? 202 : 200).json({ ...result, campaign: updated, message: result.skipped ? 'The delivery worker is busy. Your campaign remains queued.' : updated.lastDeliveryError || (updated.status === 'sent' ? 'Campaign sent' : updated.nextChunkAt && updated.nextChunkAt > new Date() ? `Next chunk: ${updated.nextChunkAt.toISOString()}` : 'Delivery batch processed; remaining recipients stay queued') });
+});
+exports.retryRejected = asyncRoute(async (req, res) => {
+  const filter = { _id: objectId(req.params.id), userId: req.user.id };
+  const campaign = await Campaign.findOne(filter).lean();
+  if (!campaign) fail(404, 'Campaign not found');
+  if (!retryStatuses.includes(campaign.status)) fail(409, 'The campaign already has active delivery.');
+  if (campaign.smtpHold?.until > new Date() || await JobLock.exists({ _id: mailboxHoldId(), expiresAt: { $gt: new Date() } })) {
+    fail(409, 'SMTP sending is paused. Retry after the pause ends.');
+  }
+
+  const rejected = campaign.recipients.flatMap((recipient, index) =>
+    recipient.deliveryStatus === 'failed' && !recipient.initialPermanentFailure &&
+    (recipient.lastSmtpFailure?.confirmedRejected || recipient.lastError === LEGACY_REJECTION) ? [index] : []);
+  if (!rejected.length) fail(409, 'There are no confirmed rejections eligible for retry.');
+
+  const set = {
+    status: 'queued',
+    nextChunkAt: null,
+    currentChunk: campaign.chunkSize ? Math.floor(rejected[0] / campaign.chunkSize) : 0,
+  };
+  const retried = new Set(rejected);
+  set.lastDeliveryError = summarizeDeliveryErrors(campaign.recipients.filter((_, i) => !retried.has(i)));
+  for (const index of rejected) {
+    set[`recipients.${index}.deliveryStatus`] = 'pending';
+    set[`recipients.${index}.initialAttempts`] = 0;
+    set[`recipients.${index}.lastError`] = null;
+  }
+  const updated = await Campaign.updateOne({ ...filter, status: campaign.status, updatedAt: campaign.updatedAt }, { $set: set });
+  if (!updated.modifiedCount) fail(409, 'Campaign changed. Refresh it and try again.');
+  res.status(202).json({ queued: rejected.length, message: `Queued ${rejected.length} rejected messages for retry.` });
 });
 exports.getAllCampaigns = asyncRoute(async (req, res) => {
   const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
   const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 10));
   const filter = { userId: req.user.id };
   if (req.query.search) filter.campaignName = { $regex: String(req.query.search).slice(0, 200).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
-  const [total, campaigns] = await Promise.all([Campaign.countDocuments(filter), Campaign.find(filter).select('-recipients -emailTemplateBody -emailTemplateClosing').sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit)]);
+  const [total, campaigns, hold] = await Promise.all([
+    Campaign.countDocuments(filter),
+    Campaign.find(filter).select('-recipients -emailTemplateBody -emailTemplateClosing').sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+    JobLock.findOne({ _id: mailboxHoldId(), expiresAt: { $gt: new Date() } }).lean(),
+  ]);
+  const terminalIds = campaigns.filter(campaign => retryStatuses.includes(campaign.status)).map(campaign => campaign._id);
+  const eligible = terminalIds.length
+    ? await Campaign.find({ _id: { $in: terminalIds }, recipients: { $elemMatch: rejectedRecipients } }).select('_id').lean()
+    : [];
+  const retryIds = new Set(eligible.map(campaign => String(campaign._id)));
+  for (const campaign of campaigns) {
+    campaign.canRetryRejected = retryIds.has(String(campaign._id));
+    if (campaign.smtpHold?.until <= new Date()) campaign.smtpHold = null;
+    if (hold && (!campaign.smtpHold || hold.expiresAt > campaign.smtpHold.until) &&
+      (campaign.canRetryRejected || ['queued', 'scheduled', 'sending'].includes(campaign.status))) {
+      campaign.smtpHold = { until: hold.expiresAt, reason: hold.reason };
+    }
+  }
   res.json({ campaigns, total });
 });
 exports.getCampaignById = asyncRoute(async (req, res) => {

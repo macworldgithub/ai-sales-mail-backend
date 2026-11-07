@@ -13,12 +13,14 @@ function inCurrentChunk(campaign, index) {
   const start = (campaign.currentChunk || 0) * campaign.chunkSize;
   return index >= start && index < start + campaign.chunkSize;
 }
-const retryable = recipient => ['pending', 'failed'].includes(recipient.deliveryStatus) && (recipient.initialAttempts || 0) < 3;
+const retryable = recipient => ['pending', 'failed'].includes(recipient.deliveryStatus) && !recipient.initialPermanentFailure && (recipient.initialAttempts || 0) < 3;
 function nextChunkUpdate(campaign, now = new Date()) {
   if (!campaign.chunkSize || !chunkReady(campaign, now)) return {};
   const start = (campaign.currentChunk || 0) * campaign.chunkSize;
   const end = start + campaign.chunkSize;
-  if (end >= campaign.recipients.length || campaign.recipients.slice(start, end).some(retryable)) return {};
-  return { currentChunk: (campaign.currentChunk || 0) + 1, nextChunkAt: new Date(now.getTime() + campaign.chunkGapSeconds * 1000) };
+  if (campaign.recipients.slice(start, end).some(retryable)) return {};
+  const next = campaign.recipients.findIndex((recipient, index) => index >= end && retryable(recipient));
+  if (next < 0) return { nextChunkAt: null };
+  return { currentChunk: Math.floor(next / campaign.chunkSize), nextChunkAt: new Date(now.getTime() + campaign.chunkGapSeconds * 1000) };
 }
 module.exports = { parseChunks, chunkReady, inCurrentChunk, retryable, nextChunkUpdate };

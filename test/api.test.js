@@ -270,7 +270,7 @@ test('chunk settings are validated and timed gaps survive repeated processing an
 test('a partial chunk retries only failed recipients before advancing and waits for its gap', async () => {
   const created = await request('/campaigns/create', 'POST', { ...campaignData, recipients: [{ Email: 'good@example.com' }, { Email: 'reject@example.com' }, { Email: 'next@example.com' }], chunkSize: 2, chunkGapSeconds: 300 }, tokenA);
   const id = created.data.campaign._id, sent = [];
-  const transporter = { sendMail: async mail => { sent.push(mail.to); if (mail.to === 'reject@example.com') { const error = new Error('Rejected'); error.responseCode = 550; throw error; } return { rejected: [] }; } };
+  const transporter = { sendMail: async mail => { sent.push(mail.to); if (mail.to === 'reject@example.com') { const error = new Error('Temporarily rejected'); error.responseCode = 450; throw error; } return { rejected: [] }; } };
   const run = () => runJobs({ campaignId: id, includeAutomation: false, transporter });
   await run(); let fresh = await Campaign.findById(id); assert.equal(fresh.currentChunk, 0); assert.equal(fresh.nextChunkAt, null);
   await run(); fresh = await Campaign.findById(id); assert.equal(fresh.currentChunk, 0);
@@ -303,6 +303,67 @@ test('branded templates retain the signature and emit an inline MIME image with 
   assert.equal(preview.status, 200); assert.ok(preview.data.signature.url.endsWith('/email/assets/event-transportation-signature.png'));
   const image = await request('/email/assets/event-transportation-signature.png'); assert.equal(image.status, 200); assert.equal(image.headers.get('cross-origin-resource-policy'), 'cross-origin');
   assert.equal((await request('/email/preview', 'POST', { subject: 'A', body: 'B', closing: 'C', signatureId: '../../.env', recipient: recipient.data }, tokenA)).status, 400);
+});
+
+test('SMTP rate rejection pauses the mailbox and preserves the chunk and retry budget', async () => {
+  const JobLock = require('../models/JobLock');
+  const { mailboxHoldId } = require('../utils/smtpFailure');
+  const created = await request('/campaigns/create', 'POST', {
+    ...campaignData, chunkSize: 2, chunkGapSeconds: 60,
+    recipients: ['first', 'second', 'third'].map(name => ({ email: `${name}@example.com` })),
+  }, tokenA);
+  const id = created.data.campaign._id;
+  let calls = 0;
+  const transporter = { sendMail: async () => {
+    calls++;
+    throw Object.assign(new Error('Rejected'), {
+      responseCode: 550, command: 'DATA', response: '550 5.7.1 Daily sending limit reached for sender@example.com',
+    });
+  } };
+  try {
+    const run = () => runJobs({ campaignId: id, includeAutomation: false, transporter });
+    const result = await run();
+    const campaign = await Campaign.findById(id).lean();
+    assert.equal(calls, 1);
+    assert.equal(campaign.currentChunk, 0);
+    assert.equal(campaign.recipients[0].initialAttempts || 0, 0);
+    assert.deepEqual(campaign.recipients.map(r => r.deliveryStatus), ['failed', 'pending', 'pending']);
+    assert.match(campaign.lastDeliveryError, /550 5\.7\.1 Daily sending limit/);
+    assert.doesNotMatch(campaign.lastDeliveryError, /sender@example\.com/);
+    assert.ok(result.smtpHold.until.getTime() > Date.now() + 23 * 3600000);
+    assert.equal((await run()).processed, 0);
+    const manual = await request(`/campaigns/${id}/process`, 'POST', {}, tokenA);
+    assert.equal(manual.status, 202);
+    assert.ok(manual.data.smtpHold);
+    assert.equal(calls, 1);
+  } finally {
+    await JobLock.deleteOne({ _id: mailboxHoldId() });
+  }
+});
+
+test('retrying a legacy campaign queues only confirmed rejections and rewinds its chunk cursor', async () => {
+  const owner = require('jsonwebtoken').decode(tokenA).id;
+  const recipients = normalizeRecipients(['sent', 'held', 'rejected', 'invalid'].map(name => ({ email: `${name}@example.com` })));
+  Object.assign(recipients[0], { deliveryStatus: 'sent', messageId: '<accepted@example.com>' });
+  Object.assign(recipients[1], { deliveryStatus: 'sending', messageId: '<uncertain@example.com>' });
+  Object.assign(recipients[2], { deliveryStatus: 'failed', initialAttempts: 3, lastError: 'The SMTP server rejected the message.' });
+  Object.assign(recipients[3], { deliveryStatus: 'failed', initialAttempts: 1, initialPermanentFailure: true, lastSmtpFailure: { confirmedRejected: true } });
+  const campaign = await Campaign.create({
+    ...fields, userId: owner, campaignName: 'Retry rejected only', description: 'Legacy SMTP failure',
+    status: 'attention', chunkSize: 1, chunkGapSeconds: 60, currentChunk: 3, totalEmailSent: 1, recipients,
+  });
+  const path = `/campaigns/${campaign._id}/retry-rejected`;
+  const list = await request('/campaigns/getAll?search=Retry%20rejected%20only', 'GET', undefined, tokenA);
+  assert.equal(list.data.campaigns[0].canRetryRejected, true);
+  assert.equal((await request(path, 'POST', {}, tokenB)).status, 404);
+  const response = await request(path, 'POST', {}, tokenA);
+  assert.equal(response.status, 202); assert.equal(response.data.queued, 1);
+  assert.equal((await request(path, 'POST', {}, tokenA)).status, 409);
+  const fresh = await Campaign.findById(campaign._id).lean();
+  assert.equal(fresh.currentChunk, 2);
+  assert.equal(fresh.totalEmailSent, 1);
+  assert.equal(fresh.recipients[1].messageId, '<uncertain@example.com>');
+  assert.deepEqual(fresh.recipients.map(r => r.deliveryStatus), ['sent', 'sending', 'pending', 'failed']);
 });
 
 test('scheduled worker respects another invocation’s lease', async () => {

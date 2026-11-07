@@ -9,6 +9,8 @@ const JobLock = require('../models/JobLock');
 const { mailContent } = require('../utils/email');
 const { dueSchedule } = require('../utils/schedule');
 const { chunkReady, inCurrentChunk, retryable, nextChunkUpdate } = require('../utils/chunks');
+const { smtpFailure, mailboxHoldId, summarizeDeliveryErrors } = require('../utils/smtpFailure');
+const { log } = require('../utils/logger');
 function transport() {
   if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS || !process.env.TRACKING_SECRET || !process.env.SERVER_URL) throw new Error('Email delivery is not configured');
   return nodemailer.createTransport({
@@ -50,9 +52,9 @@ async function checkReplies(deadline) {
     }
   } finally { connection.close(); }
 }
-async function deliver(transporter, campaign, recipient, template, kind) {
+async function deliver(transporter, campaign, recipient, template, kind, result = {}) {
   const state = kind === 'initial' ? 'deliveryStatus' : kind === 'reply' ? 'replyStatus' : 'followUpStatus';
-  const query = { _id: campaign._id, recipients: { $elemMatch: { email: recipient.email, [state]: { $nin: ['sending', 'sent'] } } } };
+  const query = { _id: campaign._id, recipients: { $elemMatch: { email: recipient.email, [state]: { $nin: ['sending', 'sent'] }, [`${kind}PermanentFailure`]: { $ne: true } } } };
   if (kind === 'initial') {
     if (!chunkReady(campaign) || !inCurrentChunk(campaign, campaign.recipients.findIndex(r => r.email === recipient.email))) return false;
     Object.assign(query, dueSchedule());
@@ -76,13 +78,23 @@ async function deliver(transporter, campaign, recipient, template, kind) {
     });
     if (info.rejected?.length) { const error = new Error('Recipient rejected by mail server'); error.responseCode = 550; throw error; }
   } catch (error) {
-    const safeToRetry = error.responseCode >= 400 || ['EDNS', 'ECONNECTION', 'EAUTH'].includes(error.code);
-    const reason = error.code === 'EAUTH' ? 'Mailbox authentication failed. Check EMAIL_USER and EMAIL_PASS.'
-      : ['EDNS', 'ECONNECTION'].includes(error.code) ? 'Cannot connect to the SMTP server. Check the mail server settings.'
-      : 'The SMTP server rejected the message.';
+    const failure = smtpFailure(error);
+    log('smtp_delivery_error', { campaignId: String(campaign._id), kind, ...failure }, 'error');
+    if (failure.retryAt) {
+      await JobLock.updateOne({ _id: mailboxHoldId() }, {
+        $max: { expiresAt: failure.retryAt },
+        $set: { reason: failure.message },
+      }, { upsert: true });
+      result.smtpHold = { until: failure.retryAt, reason: failure.message };
+    }
     await Campaign.updateOne({ _id: campaign._id, 'recipients.email': recipient.email }, {
-      $set: { [`recipients.$.${state}`]: safeToRetry ? 'failed' : 'sending', 'recipients.$.lastError': safeToRetry ? reason : 'Delivery outcome is uncertain. Review the sender mailbox before retrying.' },
-      $inc: { [`recipients.$.${kind}Attempts`]: 1 },
+      $set: {
+        [`recipients.$.${state}`]: failure.confirmedRejected ? 'failed' : 'sending',
+        [`recipients.$.${kind}PermanentFailure`]: failure.permanent,
+        'recipients.$.lastError': failure.message,
+        'recipients.$.lastSmtpFailure': { ...failure, at: new Date() },
+      },
+      ...(failure.retryAt ? {} : { $inc: { [`recipients.$.${kind}Attempts`]: 1 } }),
     });
     return true;
   }
@@ -105,7 +117,10 @@ async function runJobs({ transporter: providedTransport, checkInbox = checkRepli
   const deadline = Date.now() + timeBudgetMs;
   let processed = 0;
   const errors = [];
+  const result = {};
   try {
+    const hold = await JobLock.findOne({ _id: mailboxHoldId(), expiresAt: { $gt: new Date() } }).lean();
+    if (hold) return { processed, errors, smtpHold: { until: hold.expiresAt, reason: hold.reason } };
     const transporter = providedTransport || transport();
     if (includeAutomation) {
       try { await checkInbox(Math.min(deadline, Date.now() + 45000)); } catch { errors.push('Inbox checking failed. Check IMAP credentials and access.'); }
@@ -119,6 +134,7 @@ async function runJobs({ transporter: providedTransport, checkInbox = checkRepli
     }).sort({ updatedAt: 1 }).limit(25);
     for (const campaign of campaigns) {
       if (Date.now() > deadline || processed >= 250) break;
+      if (campaign.smtpHold?.until > new Date()) continue;
       const reply = includeAutomation && campaign.isAutomatedReply ? await Reply.findOne({ campaignId: String(campaign._id) }).sort({ updatedAt: -1 }) : null;
       const followUp = includeAutomation && campaign.hasFollowUp ? await FollowUp.findOne({ campaignId: String(campaign._id) }).sort({ updatedAt: -1 }) : null;
       let campaignProcessed = 0;
@@ -126,21 +142,25 @@ async function runJobs({ transporter: providedTransport, checkInbox = checkRepli
         if (Date.now() > deadline || processed >= 250 || campaignProcessed >= (campaign.chunkSize || 25)) break;
         let kind, template;
         if (retryable(recipient) && chunkReady(campaign) && inCurrentChunk(campaign, index)) { kind = 'initial'; template = campaign; }
-        else if (recipient.deliveryStatus === 'sent' && recipient.replied && !recipient.autoReplySent && recipient.replyStatus !== 'sending' && (recipient.replyAttempts || 0) < 3 && reply) { kind = 'reply'; template = reply; }
-        else if (recipient.deliveryStatus === 'sent' && !recipient.replied && followUp && recipient.followUpStatus !== 'sending' && recipient.followUpStatus !== 'sent' && (recipient.followUpAttempts || 0) < 3 && new Date(recipient.sentAt).getTime() + campaign.followUpDuration * 86400000 <= Date.now()) { kind = 'followUp'; template = followUp; }
-        if (kind && await deliver(transporter, campaign, recipient, template, kind)) { processed++; campaignProcessed++; }
+        else if (recipient.deliveryStatus === 'sent' && recipient.replied && !recipient.autoReplySent && !recipient.replyPermanentFailure && recipient.replyStatus !== 'sending' && (recipient.replyAttempts || 0) < 3 && reply) { kind = 'reply'; template = reply; }
+        else if (recipient.deliveryStatus === 'sent' && !recipient.replied && followUp && !recipient.followUpPermanentFailure && recipient.followUpStatus !== 'sending' && recipient.followUpStatus !== 'sent' && (recipient.followUpAttempts || 0) < 3 && new Date(recipient.sentAt).getTime() + campaign.followUpDuration * 86400000 <= Date.now()) { kind = 'followUp'; template = followUp; }
+        if (kind && await deliver(transporter, campaign, recipient, template, kind, result)) { processed++; campaignProcessed++; }
+        if (result.smtpHold) break;
       }
       const fresh = await Campaign.findById(campaign._id);
       const states = fresh.recipients.map(r => r.deliveryStatus);
       const status = fresh.scheduledAt && fresh.scheduledAt.getTime() > Date.now() && !fresh.totalEmailSent ? 'scheduled'
         : states.every(s => s === 'sent') ? 'sent'
-        : fresh.recipients.some(r => ['pending', 'failed'].includes(r.deliveryStatus) && (r.initialAttempts || 0) < 3) ? 'sending'
+        : fresh.recipients.some(retryable) ? 'sending'
         : states.includes('sending') ? 'attention' : 'failed';
-      const lastDeliveryError = [...new Set(fresh.recipients.map(r => r.lastError).filter(Boolean))].join(' ') || null;
+      const lastDeliveryError = summarizeDeliveryErrors(fresh.recipients);
       // Do not overwrite a schedule changed after this batch read the campaign.
-      await Campaign.updateOne({ _id: campaign._id, scheduledAt: fresh.scheduledAt || null, ...(fresh.chunkSize ? { currentChunk: fresh.currentChunk || 0 } : {}) }, { $set: { status, lastDeliveryError, lastProcessedAt: new Date(), ...nextChunkUpdate(fresh) } });
+      await Campaign.updateOne({ _id: campaign._id, updatedAt: fresh.updatedAt }, {
+        $set: { status, lastDeliveryError, smtpHold: result.smtpHold || null, lastProcessedAt: new Date(), ...nextChunkUpdate(fresh) },
+      });
+      if (result.smtpHold) break;
     }
-    return { processed, errors };
+    return { processed, errors, ...result };
   } finally {
     await JobLock.updateOne({ _id: 'mail-jobs', owner }, { $set: { expiresAt: new Date(0), lastRunAt: new Date() } });
   }

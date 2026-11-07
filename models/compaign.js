@@ -10,6 +10,7 @@ const campaignSchema = new mongoose.Schema({
   chunkGapSeconds: { type: Number, default: null },
   currentChunk: { type: Number, default: 0 },
   nextChunkAt: { type: Date, default: null },
+  smtpHold: { type: new mongoose.Schema({ until: Date, reason: String }, { _id: false }), default: null },
   emailSignatureId: { type: String, default: null },
   lastProcessedAt: { type: Date, default: null },
   lastDeliveryError: { type: String, default: null },
