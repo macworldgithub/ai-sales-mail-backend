@@ -7,6 +7,7 @@ const {
   updateSchedule,
   processCampaign,
   retryRejected,
+  getRecipientDelivery,
 } = require("../controllers/CampaignController");
 const authMiddleware = require("../middlewares/authMiddleware");
 
@@ -16,6 +17,7 @@ router.post("/create",authMiddleware, createCampaign);
 router.get("/total", authMiddleware,getTotalCampaigns);
 router.get("/getAll",authMiddleware, getAllCampaigns);
 router.get("/getById/:id", authMiddleware,getCampaignById);
+router.get('/:id/recipients', authMiddleware, getRecipientDelivery);
 router.patch('/:id/schedule', authMiddleware, updateSchedule);
 router.post('/:id/process', authMiddleware, require('../middlewares/rateLimit')('delivery', 120, 3600000), processCampaign);
 router.post('/:id/retry-rejected', authMiddleware, require('../middlewares/rateLimit')('delivery', 120, 3600000), retryRejected);

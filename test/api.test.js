@@ -364,6 +364,37 @@ test('retrying a legacy campaign queues only confirmed rejections and rewinds it
   assert.equal(fresh.totalEmailSent, 1);
   assert.equal(fresh.recipients[1].messageId, '<uncertain@example.com>');
   assert.deepEqual(fresh.recipients.map(r => r.deliveryStatus), ['sent', 'sending', 'pending', 'failed']);
+  const delivery = await request(`/campaigns/${campaign._id}/recipients`, 'GET', undefined, tokenA);
+  assert.equal(delivery.status, 200);
+  assert.deepEqual(delivery.data.recipients[2], { email: 'rejected@example.com', status: 'retrying', sentAt: null });
+});
+
+test('recipient delivery is private and distinguishes waiting, retrying and uncertain sends', async () => {
+  const userId = require('jsonwebtoken').decode(tokenA).id;
+  const sentAt = new Date('2025-01-01T00:00:00Z');
+  const rows = [
+    [{ deliveryStatus: 'sent', sentAt }, 'sent'],
+    [{ deliveryStatus: 'failed', initialAttempts: 1 }, 'retrying'],
+    [{ deliveryStatus: 'pending' }, 'waiting'],
+    [{ deliveryStatus: 'failed', initialAttempts: 3 }, 'failed'],
+    [{ deliveryStatus: 'sending' }, 'sending'],
+    [{ deliveryStatus: 'sending', lastSmtpFailure: { confirmedRejected: false } }, 'review'],
+    [{ sentAt }, 'sent'],
+    [{}, 'unknown'],
+  ];
+  const campaign = await Campaign.create({ ...fields, userId, campaignName: 'Recipient delivery', description: 'Status test', status: 'sending',
+    recipients: rows.map(([fields], i) => ({ ...fields, email: `person${i}@example.com`, data: { name: 'Private personalization data' } })),
+  });
+  const path = `/campaigns/${campaign.id}/recipients`;
+  assert.equal((await request(path)).status, 401);
+  assert.equal((await request(path, 'GET', undefined, tokenB)).status, 404);
+  const response = await request(path, 'GET', undefined, tokenA);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(response.data.recipients, rows.map(([fields, status], i) => ({
+    email: `person${i}@example.com`, status, sentAt: fields.sentAt?.toISOString() || null,
+  })));
+  await Campaign.deleteOne({ _id: campaign.id });
 });
 
 test('scheduled worker respects another invocation’s lease', async () => {

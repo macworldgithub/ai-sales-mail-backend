@@ -3,9 +3,10 @@ const JobLock = require('../models/JobLock');
 const { asyncRoute, fail, text, objectId, emailFields } = require('../utils/http');
 const { normalizeRecipients } = require('../utils/email');
 const { parseSchedule } = require('../utils/schedule');
-const { parseChunks, chunkReady } = require('../utils/chunks');
+const { parseChunks, chunkReady, retryable } = require('../utils/chunks');
 const { mailboxHoldId, summarizeDeliveryErrors, LEGACY_REJECTION } = require('../utils/smtpFailure');
 const retryStatuses = ['failed', 'attention'];
+const activeDeliveryStatuses = ['queued', 'scheduled', 'sending'];
 const rejectedRecipients = {
   deliveryStatus: 'failed',
   initialPermanentFailure: { $ne: true },
@@ -85,6 +86,7 @@ exports.retryRejected = asyncRoute(async (req, res) => {
   set.lastDeliveryError = summarizeDeliveryErrors(campaign.recipients.filter((_, i) => !retried.has(i)));
   for (const index of rejected) {
     set[`recipients.${index}.deliveryStatus`] = 'pending';
+    set[`recipients.${index}.initialRetryQueued`] = true;
     set[`recipients.${index}.initialAttempts`] = 0;
     set[`recipients.${index}.lastError`] = null;
   }
@@ -111,7 +113,7 @@ exports.getAllCampaigns = asyncRoute(async (req, res) => {
     campaign.canRetryRejected = retryIds.has(String(campaign._id));
     if (campaign.smtpHold?.until <= new Date()) campaign.smtpHold = null;
     if (hold && (!campaign.smtpHold || hold.expiresAt > campaign.smtpHold.until) &&
-      (campaign.canRetryRejected || ['queued', 'scheduled', 'sending'].includes(campaign.status))) {
+      (campaign.canRetryRejected || activeDeliveryStatuses.includes(campaign.status))) {
       campaign.smtpHold = { until: hold.expiresAt, reason: hold.reason };
     }
   }
@@ -120,6 +122,26 @@ exports.getAllCampaigns = asyncRoute(async (req, res) => {
 exports.getCampaignById = asyncRoute(async (req, res) => {
   const campaign = await Campaign.findOne({ _id: objectId(req.params.id), userId: req.user.id });
   if (!campaign) fail(404, 'Campaign not found'); res.json(campaign);
+});
+function recipientStatus(recipient, campaignStatus) {
+  switch (recipient.deliveryStatus) {
+    case 'sent': return 'sent';
+    case 'pending': return recipient.initialRetryQueued || recipient.messageId ? 'retrying' : 'waiting';
+    case 'failed': return activeDeliveryStatuses.includes(campaignStatus) && retryable(recipient) ? 'retrying' : 'failed';
+    case 'sending': return activeDeliveryStatuses.includes(campaignStatus) && recipient.lastSmtpFailure?.confirmedRejected !== false ? 'sending' : 'review';
+    default: return recipient.sentAt || campaignStatus === 'sent' ? 'sent' : 'unknown';
+  }
+}
+exports.getRecipientDelivery = asyncRoute(async (req, res) => {
+  const campaign = await Campaign.findOne({ _id: objectId(req.params.id), userId: req.user.id })
+    .select('status recipients.email recipients.deliveryStatus recipients.sentAt recipients.initialAttempts recipients.initialPermanentFailure recipients.initialRetryQueued recipients.messageId recipients.lastSmtpFailure.confirmedRejected').lean();
+  if (!campaign) fail(404, 'Campaign not found');
+  const recipients = (campaign.recipients || []).filter(recipient => typeof recipient?.email === 'string' && recipient.email.trim());
+  res.set('Cache-Control', 'no-store').json({ recipients: recipients.map(recipient => ({
+    email: recipient.email,
+    status: recipientStatus(recipient, campaign.status),
+    sentAt: recipient.sentAt || null,
+  })) });
 });
 exports.getTotalCampaigns = asyncRoute(async (req, res) => {
   const stats = await Campaign.aggregate([
